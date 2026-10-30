@@ -46,11 +46,3 @@ Bridge flags: `--temperature`, `--max-tokens`, `--no-json-mode`, `--extra-system
 The LLM only sees enemy units you can see (omni/vision) or structures you have seen before; radar-only blips are
 counted but not identified. It is told enemy start positions (config `RevealEnemyStarts`).
 
-## Assumptions I could not verify (check these first if something fails)
-1. `hook/lua/aibrain.lua` assumes LOUD still defines a global `AIBrain` class with `OnCreateAI`/`OnCreateHuman` in `/lua/aibrain.lua`.
-   If the log says the hook did not run, set `Takeover = 'overlay'` (LOUD's AI keeps running and fights the LLM for units).
-2. `hook/lua/SimInit.lua` assumes a global `BeginSession` in `/lua/SimInit.lua`.
-3. `doscript` re-reading `bridge/inbox.lua` while the game runs, and the engine flushing `LOG` lines promptly to the log file.
-   Symptom: bridge prints turns but the game never prints `executed orders`, or states arrive in bursts.
-4. Lua 5.0 API names (`GetListOfUnits`, `CanBuildStructureAt`, `IssueBuildMobile`, `IssueFactoryRallyPoint`, ...) follow stock FA; LOUD may differ.
-Failures are caught with `pcall` and reported in the log as `LLMC|I|...` / `WARN`, and fed back to the LLM in `last_results`.
