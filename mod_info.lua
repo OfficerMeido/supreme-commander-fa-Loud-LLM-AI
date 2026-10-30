@@ -1,0 +1,10 @@
+name = "LLM Commander"
+version = 1
+copyright = "MIT"
+description = "Lets a local LLM (llama.cpp / Ollama / LM Studio) command one AI slot. Requires the external bridge script in /bridge. Skirmish vs AI only - NOT multiplayer-safe."
+author = "Claude (Anthropic)"
+url = ""
+uid = "b3c7e1d2-5a49-4c0e-9f61-1a2b3c4d5e6f"
+exclusive = false
+ui_only = false
+conflicts = {}

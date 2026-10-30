@@ -1,5 +1,3 @@
-# supreme-commander-fa-Loud-AI
-This Mod allows a Local llama server to play supreme-commander vibe coded useing claude.ai
 # LLM Commander (Supreme Commander: Forged Alliance + LOUD)
 
 A local LLM (llama.cpp `llama-server`, Ollama, LM Studio, anything OpenAI-compatible) plays one army.
