@@ -19,8 +19,8 @@ LOUD's units), finds legal build spots, and issues the commands. Every order is 
 game loads is plain Lua literals run in an empty environment.
 
 ## Install
-1. Copy the `LLMCommander` folder into the mods folder your LOUD install uses (next to its other mods).
-   **The folder must be named exactly `LLMCommander`.**
+1. Create the `LLMCommander` folder into the mods folder your LOUD install uses (next to its other mods).
+   **The folder must be named exactly `LLMCommander`.** extract all of the zip contents to the `LLMCommander` folder.
 2. Start the game with a log file, e.g. add `/log "Loud-Dev.log"` (LOUD's dev shortcut already has it).
 3. Start your LLM server, e.g. `llama-server -m model.gguf -c 8192 --port 8080`.
 4. Test the model without the game: `python bridge/llm_bridge.py --selftest --server http://127.0.0.1:8080/v1`
