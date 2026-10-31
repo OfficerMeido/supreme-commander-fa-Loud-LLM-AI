@@ -30,7 +30,7 @@ ALLOWED_ACTIONS = {
     "attack", "move", "patrol", "retreat", "stop", "scout", "rally", "strategy",
 }
 
-MICRO_ACTIONS = {"order", "focus", "scout", "release"}
+MICRO_ACTIONS = {"order", "focus", "scout", "release", "sacu", "defense_cluster", "mass_farm", "experimental"}
 
 MICRO_PROMPT = """You are LLM Micro, a tactical micro-manager for a Supreme Commander: Forged Alliance (LOUD mod) army.
 The built-in LOUD AI plays the whole game: economy, tech, base building, unit production and its own attack plans. You do NOT control any of that.
@@ -46,9 +46,15 @@ WHAT TO DO (priorities)
 2. Concentrate: merge small groups before attacking (move them to the same point), attack with the full group, do not trickle units in.
 3. Focus fire on what matters: {"a":"focus","near":<group pos>,"radius":60,"tx":X,"tz":Z,"prefer":"acu"|"defense"|"structure"|"mobile"|"air"|"land"}.
 4. Defend home when under_attack: send land/air groups to the threat.
-5. Raid and scout: bombers/gunships against weakly defended enemy clusters; scouts to unexplored enemy start positions: {"a":"scout","x":X,"z":Z}.
-6. state.rescue_active=true means the AI had stalled (idle builders while mass/energy floated) and the mod's macro manager is temporarily spending resources for it (see state.macro_recent). You do not handle that - keep micro-managing units only.
-7. If everything is fine, issue NO orders: the AI is already playing. Doing nothing is a good answer. Do not micro-manage for the sake of it.
+5. QUANTUM GATEWAY ACUs: every ACU (SACU) the Quantum Gateway builds is permanently yours (state.gateway: built, sacus, idle, ids). Use them for these three jobs, in this priority:
+   a) BASE DEFENCES LACKING (state.defense_status.lacking = true, i.e. no shield, fewer than 6 AA or fewer than 8 PD+artillery near base): build defenses FIRST:
+      {"a":"defense_cluster","near":[x,z]} = a Tech 3 shield, then 10 SAMs under it, then a mix of T2 artillery and T2 point defense, as many as fit under the shield. Put it where your base needs cover (default: base).
+   b) MASS IS NOT BEING USED (state.eco.mass high, e.g. >= 0.7, or state.rescue_active): build Tech 4 units: {"a":"experimental","what":"land"|"air"|"any","near":[x,z],"n":1}. Do not stack several experimentals at once.
+   c) Otherwise, when mass is short: {"a":"mass_farm","near":[x,z]} = a Tech 3 power plant surrounded by 16 T2 mass fabricators (limited number of farms; expensive).
+   Move or recall them with {"a":"sacu","cmd":"move"|"retreat"|"stop","x":X,"z":Z}. The mod also runs these rules automatically when a gateway ACU is idle; check state.auto_recent and do not duplicate what it just ordered.
+6. Raid and scout: bombers/gunships against weakly defended enemy clusters; scouts to unexplored enemy start positions: {"a":"scout","x":X,"z":Z}.
+7. state.rescue_active=true means the AI had stalled (idle builders while mass/energy floated) and the mod's macro manager is temporarily spending resources for it (see state.macro_recent). You do not handle that - keep micro-managing units only.
+8. If everything is fine, issue NO orders: the AI is already playing. Doing nothing is a good answer. Do not micro-manage for the sake of it.
 
 ACTIONS (each object has key "a"; max 12 per turn)
  {"a":"order","cmd":"attack"|"move"|"patrol"|"retreat"|"stop","role":ROLE,"near":[x,z],"radius":55,"hp_below":0.4,"hp_above":0.6,"n":20,"x":X,"z":Z,"points":[[x,z],[x,z]],"queue":false}
@@ -57,6 +63,7 @@ ACTIONS (each object has key "a"; max 12 per turn)
  {"a":"focus","role":ROLE,"near":[x,z],"radius":55,"tx":X,"tz":Z,"prefer":"acu","hp_above":0.3}   selected units attack ONE visible enemy near (tx,tz)
  {"a":"scout","x":X,"z":Z}   or with "points"
  {"a":"release","role":ROLE,"near":[x,z],"radius":80}   give units back to the AI now
+ {"a":"defense_cluster","near":[x,z]}   {"a":"mass_farm","near":[x,z]}   {"a":"experimental","what":"land|air|any","near":[x,z],"n":1}   {"a":"sacu","cmd":"move|retreat|stop","x":X,"z":Z}   (gateway ACUs only)
 
 Coordinates are world [x, z]. Read state.last_results: it tells you what your last orders did or why they failed.
 
@@ -101,9 +108,6 @@ RULES
 - Do not repeat orders that are already in progress (check factories[].queue, engineers.idle, structures counts).
 - Read state.last_results: it tells you which of your last orders failed and why.
 - ECONOMY-ONLY OPENING: while state.economy_only_until is present (first 5 game minutes) only mex, hydro, pgen, fabricator, storage, engineers and mex upgrades work; everything else is refused. Focus on economy and use the time to plan.
-- Mass extractor upgrades (T1->T2 and T2->T3): one at a time, and only when stored mass is above 50%. The opening has 2 engineers build the first 4 mex; after that get more mass by building mex on free spots or upgrading them.
-- state.holding_mass_for_upgrades=true means mass is reserved for mex/factory upgrades: engineers, units, extra factories and radar are refused (factories idle on purpose) unless the base is attacked. Do not fight it.
-- EARLY POWER LIMIT: in the first 5 game minutes only 1 power generator per 2 mass extractors is allowed (more pgen orders are refused); build mass extractors first.
 - No new engineers are built while any engineer is idle (the macro stops, and produce engineer orders are refused).
 - Idle engineers and the idle ACU automatically assist a mass extractor upgrade or an ACU upgrade (enhancement) in progress, and NOTHING else: an "assist" order on anything other than an upgrading mex or an enhancing ACU is refused. Use {"a":"assist","target":"<id>","n":20}.
 - Factory upgrades are refused unless ALL mass extractors are already at the next tier (none upgrading) and energy storage is full; upgrade the mex first, then the factory, then build the higher-tier units.
