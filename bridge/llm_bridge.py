@@ -22,13 +22,47 @@ import time
 import urllib.error
 import urllib.request
 
-BRIDGE_VERSION = 4
+BRIDGE_VERSION = 5
 PREFIX = b"LLMC|"
 
 ALLOWED_ACTIONS = {
     "build", "produce", "upgrade", "assist", "reclaim", "enhance",
     "attack", "move", "patrol", "retreat", "stop", "scout", "rally", "strategy",
 }
+
+MICRO_ACTIONS = {"order", "focus", "scout", "release"}
+
+MICRO_PROMPT = """You are LLM Micro, a tactical micro-manager for a Supreme Commander: Forged Alliance (LOUD mod) army.
+The built-in LOUD AI plays the whole game: economy, tech, base building, unit production and its own attack plans. You do NOT control any of that.
+You ONLY micro-manage COMBAT UNITS (never engineers, structures or the commander). Every ~8 game seconds you get a JSON state and answer with short tactical orders.
+
+HOW CONTROL WORKS
+- An order takes the selected units away from the AI. After 40 game seconds without a new order from you they are handed back to the AI automatically. You can also hand them back sooner with "release". Re-issue orders each turn for groups you want to keep controlling.
+- Orders reach the game a few seconds after the state you saw: units move, so select by area (near + radius), not by exact position.
+- state.groups lists clusters of your combat units: pos, n, roles (land/air/naval/fighters/bombers/gunships/scouts counts), hp (0-1 average), idle, held_by_llm, nearest_enemy (pos, dist, composition, defenses) and engaged (enemy within 70). state.enemy lists enemy clusters you can see (structures, defenses, land/air/naval counts). state.enemy_near_base / under_attack tell you about threats at home. state.acu shows your commander.
+
+WHAT TO DO (priorities)
+1. Save units: pull badly hurt units back: {"a":"order","cmd":"retreat","near":<group pos>,"radius":60,"hp_below":0.35}. Retreat any group that is clearly outnumbered or walking into many defenses.
+2. Concentrate: merge small groups before attacking (move them to the same point), attack with the full group, do not trickle units in.
+3. Focus fire on what matters: {"a":"focus","near":<group pos>,"radius":60,"tx":X,"tz":Z,"prefer":"acu"|"defense"|"structure"|"mobile"|"air"|"land"}.
+4. Defend home when under_attack: send land/air groups to the threat.
+5. Raid and scout: bombers/gunships against weakly defended enemy clusters; scouts to unexplored enemy start positions: {"a":"scout","x":X,"z":Z}.
+6. state.rescue_active=true means the AI had stalled (idle builders while mass/energy floated) and the mod's macro manager is temporarily spending resources for it (see state.macro_recent). You do not handle that - keep micro-managing units only.
+7. If everything is fine, issue NO orders: the AI is already playing. Doing nothing is a good answer. Do not micro-manage for the sake of it.
+
+ACTIONS (each object has key "a"; max 12 per turn)
+ {"a":"order","cmd":"attack"|"move"|"patrol"|"retreat"|"stop","role":ROLE,"near":[x,z],"radius":55,"hp_below":0.4,"hp_above":0.6,"n":20,"x":X,"z":Z,"points":[[x,z],[x,z]],"queue":false}
+     attack = attack-move to x,z. retreat goes to your base (or to x,z if given). ROLE = land fighters bombers gunships naval air scouts all (default all).
+     Selection = role + units inside the circle near/radius (+ optional hp filters and a max count n, closest first).
+ {"a":"focus","role":ROLE,"near":[x,z],"radius":55,"tx":X,"tz":Z,"prefer":"acu","hp_above":0.3}   selected units attack ONE visible enemy near (tx,tz)
+ {"a":"scout","x":X,"z":Z}   or with "points"
+ {"a":"release","role":ROLE,"near":[x,z],"radius":80}   give units back to the AI now
+
+Coordinates are world [x, z]. Read state.last_results: it tells you what your last orders did or why they failed.
+
+OUTPUT FORMAT - reply with ONLY one JSON object, no prose outside it:
+{"thoughts": "<=15 words", "notes": "<=200 chars shown to you next turn", "actions": [ ... ]}
+No comments, no trailing commas."""
 
 SYSTEM_PROMPT = """You are LLM Commander, an expert Supreme Commander: Forged Alliance player (LOUD mod) controlling ONE army against AI opponents.
 You receive a JSON game state every ~15 game seconds and answer with a JSON object of orders. Your orders run a little later than the state you saw.
@@ -54,7 +88,7 @@ ACTIONS (each is an object with key "a"):
      UNITKIND = engineer land_scout tank artillery land_aa air_scout fighter bomber gunship warship submarine experimental
      Only units in state.can_build.units work. n is the total, split over capable factories.
  {"a":"upgrade","what":"mex"|"land_factory"|"air_factory"|"naval_factory","n":2}   (or {"a":"upgrade","id":"<unit id>"})
- {"a":"assist","target":"<factory id>","n":3}        idle-ish engineers help build/upgrade something
+ {"a":"assist","target":"<upgrading mex id or enhancing ACU id>","n":3}   engineers help; only valid for those two
  {"a":"reclaim","near":[x,z],"radius":40,"n":2}      engineers reclaim wrecks/trees for resources
  {"a":"enhance","name":"<name from state.acu.enhancements>"}
  {"a":"attack","squad":SQUAD,"x":X,"z":Z,"fraction":1.0}   attack-move; also "move", "patrol"; "points":[[x,z],[x,z]] for several waypoints; "queue":true to append
@@ -67,11 +101,32 @@ RULES
 - Do not repeat orders that are already in progress (check factories[].queue, engineers.idle, structures counts).
 - Read state.last_results: it tells you which of your last orders failed and why.
 - ECONOMY-ONLY OPENING: while state.economy_only_until is present (first 5 game minutes) only mex, hydro, pgen, fabricator, storage, engineers and mex upgrades work; everything else is refused. Focus on economy and use the time to plan.
+- Mass extractor upgrades (T1->T2 and T2->T3): one at a time, and only when stored mass is above 50%. The opening has 2 engineers build the first 4 mex; after that get more mass by building mex on free spots or upgrading them.
+- state.holding_mass_for_upgrades=true means mass is reserved for mex/factory upgrades: engineers, units, extra factories and radar are refused (factories idle on purpose) unless the base is attacked. Do not fight it.
+- EARLY POWER LIMIT: in the first 5 game minutes only 1 power generator per 2 mass extractors is allowed (more pgen orders are refused); build mass extractors first.
+- No new engineers are built while any engineer is idle (the macro stops, and produce engineer orders are refused).
+- Idle engineers and the idle ACU automatically assist a mass extractor upgrade or an ACU upgrade (enhancement) in progress, and NOTHING else: an "assist" order on anything other than an upgrading mex or an enhancing ACU is refused. Use {"a":"assist","target":"<id>","n":20}.
 - Factory upgrades are refused unless ALL mass extractors are already at the next tier (none upgrading) and energy storage is full; upgrade the mex first, then the factory, then build the higher-tier units.
 - Buildings other than mex/hydro/pgen/fabricator/storage are refused while stored mass or energy is low (see last_results); build economy first, then retry.
 - Spend resources: if mass or energy is piling up, build more; if one is at zero, build more of that producer first.
 - Scout with a cheap scout unit early; attack only with a clearly strong force; retreat if state.under_attack and your army is weak.
 - Never output anything except the JSON object. Be concise: thoughts under 15 words, notes under 200 characters, at most 16 actions, no comments, no trailing commas."""
+
+SAMPLE_MICRO_STATE = {
+    "mode": "micro", "seq": 1, "sid": 1, "t": 480, "faction": "UEF", "base": [100, 100], "map": {"w": 512, "h": 512},
+    "eco": {"mass": 0.4, "energy": 0.8},
+    "groups": [
+        {"pos": [220, 230], "n": 14, "roles": {"land": 14}, "hp": 0.8, "idle": 0, "held_by_llm": 0,
+         "nearest_enemy": {"pos": [260, 260], "dist": 50, "land": 22, "air": 0, "naval": 0, "structures": 2, "defenses": 2}, "engaged": True},
+        {"pos": [210, 215], "n": 6, "roles": {"land": 4, "gunships": 2}, "hp": 0.3, "idle": 0, "held_by_llm": 0,
+         "nearest_enemy": {"pos": [260, 260], "dist": 66, "land": 22, "air": 0, "naval": 0, "structures": 2, "defenses": 2}, "engaged": True},
+        {"pos": [110, 105], "n": 3, "roles": {"scouts": 1, "fighters": 2}, "hp": 1.0, "idle": 3, "held_by_llm": 0, "engaged": False},
+    ],
+    "units_held_by_llm": 0,
+    "enemy": [{"pos": [260, 260], "structures": 2, "defenses": 2, "land": 22, "air": 0, "naval": 0, "armies": [2], "dist": 230}],
+    "enemy_near_base": {"land": 0, "air": 0, "naval": 0}, "under_attack": False,
+    "acu": {"pos": [100, 100], "hp": 1.0}, "enemy_starts": [{"army": 2, "pos": [400, 400]}], "last_results": [],
+}
 
 SAMPLE_STATE = {
     "seq": 1, "sid": 1, "t": 20, "faction": "UEF", "base": [100, 100], "map": {"w": 512, "h": 512},
@@ -314,13 +369,13 @@ def lua(v):
     return "nil"
 
 
-def sanitize_actions(raw, warnings, limit):
+def sanitize_actions(raw, warnings, limit, allowed=None):
     acts = []
     if not isinstance(raw, list):
         warnings.append("actions must be a list")
         return acts
     for i, a in enumerate(raw[:limit]):
-        if not isinstance(a, dict) or a.get("a") not in ALLOWED_ACTIONS:
+        if not isinstance(a, dict) or a.get("a") not in (allowed or ALLOWED_ACTIONS):
             warnings.append(f"action {i + 1} dropped: unknown or malformed ({str(a)[:50]})")
             continue
         acts.append(clean(a))
@@ -375,7 +430,8 @@ class Bridge:
             "\nYOUR LAST ORDERS: " + json.dumps(self.prev_actions, separators=(",", ":"))[:1500] +
             "\n\nAnswer with the JSON object only."
         )
-        sysmsg = SYSTEM_PROMPT + (("\n\n" + self.extra) if self.extra else "")
+        base_prompt = MICRO_PROMPT if state.get("mode") == "micro" else SYSTEM_PROMPT
+        sysmsg = base_prompt + (("\n\n" + self.extra) if self.extra else "")
         return [{"role": "system", "content": sysmsg}, {"role": "user", "content": user}]
 
     def log_bad(self, text, err):
@@ -418,7 +474,9 @@ class Bridge:
         if truncated:
             warnings.append("reply was cut off by the token limit; keep replies shorter")
             print("[bridge] reply hit max_tokens - consider raising --max-tokens")
-        acts = sanitize_actions(obj.get("actions", []), warnings, self.args.max_actions)
+        micro = state.get("mode") == "micro"
+        acts = sanitize_actions(obj.get("actions", []), warnings, min(self.args.max_actions, 12) if micro else self.args.max_actions,
+                                MICRO_ACTIONS if micro else None)
         notes = str(obj.get("notes", ""))[:400]
         return str(obj.get("thoughts", ""))[:300], notes, acts, warnings
 
@@ -473,7 +531,7 @@ def selftest(args):
     b = Bridge(args)
     print("Sending a sample state to", args.server, "...")
     t0 = time.time()
-    thoughts, notes, acts, warnings = b.decide(SAMPLE_STATE)
+    thoughts, notes, acts, warnings = b.decide(SAMPLE_MICRO_STATE if args.selftest_mode == "micro" else SAMPLE_STATE)
     print(f"reply in {time.time() - t0:.1f}s\nthoughts: {thoughts}\nnotes: {notes}\nactions:")
     for x in acts:
         print("  ", json.dumps(x))
@@ -497,6 +555,7 @@ def main():
     p.add_argument("--no-json-mode", action="store_true", help="do not send response_format=json_object")
     p.add_argument("--extra-system", help="text file appended to the system prompt (e.g. '/no_think' or personality)")
     p.add_argument("--from-start", action="store_true", help="read the log from its beginning instead of its end")
+    p.add_argument("--selftest-mode", choices=["micro", "full"], default="micro", help="which game mode the --selftest sample state is for")
     p.add_argument("--selftest", action="store_true", help="query the LLM once with a sample state and exit")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
