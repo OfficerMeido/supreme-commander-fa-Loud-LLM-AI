@@ -111,10 +111,14 @@ function Main()
         -- 1b. automatic macro (eco, tech, production, waves) - independent of LLM latency
         if micro then
             pcall(Micro.Maintain, brain, Cfg, now)
-            if Cfg.Rescue ~= false and now >= nextMacro then
+            if now >= nextMacro then
                 nextMacro = now + Cfg.MacroInterval
-                local rok, rerr = pcall(Macro.Rescue, brain, Cfg, now)
-                if not rok then WARN('LLMC rescue error: ' .. tostring(rerr)) end
+                if Cfg.Rescue ~= false then
+                    local rok, rerr = pcall(Macro.Rescue, brain, Cfg, now)
+                    if not rok then WARN('LLMC rescue error: ' .. tostring(rerr)) end
+                end
+                local aok, aerr = pcall(Micro.Auto, brain, Cfg, now)
+                if not aok then WARN('LLMC gateway auto error: ' .. tostring(aerr)) end
             end
         elseif now >= nextMacro then
             nextMacro = now + Cfg.MacroInterval
@@ -133,7 +137,6 @@ function Main()
                     Macro.SetState(st)
                 else
                     st.strategy = Actions.Strategy
-                    st.holding_mass_for_upgrades = Actions.HoldMass and true or false
                     local nb = st.enemy_near_base
                     Actions.Emergency = (Cfg.EcoOnlyEmergency and nb and (nb.land + nb.air + nb.naval) >= 4) and true or false
                     if now < Cfg.EcoOnlySeconds and not Actions.Emergency then

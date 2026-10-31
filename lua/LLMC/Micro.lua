@@ -8,6 +8,7 @@
 
 local K = import('/mods/LLMCommander/lua/LLMC/Kinds.lua')
 local StateMod = import('/mods/LLMCommander/lua/LLMC/State.lua')
+local Gateway = import('/mods/LLMCommander/lua/LLMC/Gateway.lua')
 
 local Held = {}            -- entityId -> { unit, t = game time of the last LLM order }
 local MicroPlatoon = nil
@@ -56,12 +57,12 @@ local function EnsurePlatoon(brain)
 end
 
 -- Move units into a platoon with no AI plan so LOUD's platoon logic stops re-tasking them.
-local function Take(brain, units, now)
+local function Take(brain, units, now, perm)
     local fresh = {}
     for _, u in ipairs(units) do
         local id = tostring(u:GetEntityId())
         if not Held[id] then table.insert(fresh, u) end
-        Held[id] = { unit = u, t = now }
+        Held[id] = { unit = u, t = now, perm = perm or (Held[id] and Held[id].perm) }
     end
     if table.getn(fresh) > 0 then
         local p = EnsurePlatoon(brain)
@@ -83,13 +84,38 @@ local function Release(brain, units)
     for _, u in ipairs(units) do Held[tostring(u:GetEntityId())] = nil end
 end
 
+-- Quantum Gateway ACUs (SACUs) are claimed permanently: the LLM owns them from the moment they appear.
+local LastClaim = -100
+local function ClaimSacus(brain, now)
+    if now - LastClaim < 3 then return end
+    LastClaim = now
+    local fresh = {}
+    for _, u in ipairs(K.Select(brain:GetListOfUnits(categories.ALLUNITS, false, true), K.Recipes.sacu)) do
+        if not Held[tostring(u:GetEntityId())] then table.insert(fresh, u) end
+    end
+    if table.getn(fresh) > 0 then
+        Take(brain, fresh, now, true)
+        LOG('LLMC|I|INFO claimed ' .. table.getn(fresh) .. ' gateway ACU(s) for the LLM')
+    end
+end
+
+-- live, finished gateway ACUs owned by the LLM
+local function SacuList()
+    local out = {}
+    for _, h in pairs(Held) do
+        if h.perm and not h.unit.Dead and h.unit:GetFractionComplete() >= 1 then table.insert(out, h.unit) end
+    end
+    return out
+end
+
 -- Called every second by the controller: expire old holds, forget dead units.
 function Maintain(brain, cfg, now)
+    ClaimSacus(brain, now)
     local expired = {}
     for id, h in pairs(Held) do
         if h.unit.Dead then
             Held[id] = nil
-        elseif now - h.t > (cfg.MicroHoldSeconds or 40) then
+        elseif (not h.perm) and now - h.t > (cfg.MicroHoldSeconds or 40) then
             table.insert(expired, h.unit)
         end
     end
@@ -125,13 +151,24 @@ function BuildState(brain, cfg, seq, sid, now, lastResults)
     local cells = {}
     local structs = 0
     local acu = nil
+    local sacuList, gateways, defs, exps = {}, 0, {}, 0
     for _, u in ipairs(brain:GetListOfUnits(categories.ALLUNITS, false, true)) do
         if not u.Dead then
             local bpid = u:GetUnitId()
             local s = K.CatSet(bpid)
             if s.COMMAND then acu = u
-            elseif s.STRUCTURE then structs = structs + 1
+            elseif s.SUBCOMMANDER and s.MOBILE then
+                table.insert(sacuList, u)
+            elseif s.STRUCTURE then
+                structs = structs + 1
+                if s.GATE then gateways = gateways + 1 end
+                local k = K.StructureKind(bpid)
+                if k == 'shield' or k == 'aa' or k == 'pd' or k == 'arty' then
+                    local p = u:GetPosition()
+                    if Dist(p[1], p[3], bx, bz) <= (cfg.DefenseRadius or 90) then defs[k] = (defs[k] or 0) + 1 end
+                end
             elseif s.MOBILE and not s.ENGINEER then
+                if s.EXPERIMENTAL then exps = exps + 1 end
                 local role = K.MobileRole(bpid)
                 if role ~= 'other' then
                     local p = u:GetPosition()
@@ -193,6 +230,21 @@ function BuildState(brain, cfg, seq, sid, now, lastResults)
     st.under_attack = (e.near_base.land + e.near_base.air + e.near_base.naval) > 0
     st.radar_blips = e.radar_blips
     st.own_structures = structs
+
+    -- Quantum Gateway ACUs (owned by the LLM) and base-defence status
+    local sacuIdle, sacuIds = 0, {}
+    for _, u in ipairs(sacuList) do
+        if u:IsIdleState() then sacuIdle = sacuIdle + 1 end
+        if table.getn(sacuIds) < 8 then table.insert(sacuIds, tostring(u:GetEntityId())) end
+    end
+    st.gateway = { built = gateways > 0, sacus = table.getn(sacuList), idle = sacuIdle, ids = sacuIds }
+    local shields, aas, pds, artys = defs.shield or 0, defs.aa or 0, defs.pd or 0, defs.arty or 0
+    st.defense_status = { shields = shields, aa = aas, pd = pds, artillery = artys, radius = cfg.DefenseRadius or 90,
+        lacking = (shields == 0 or aas < 6 or (pds + artys) < 8) }
+    st.experimentals = exps
+    st.mass_farms = Gateway.Farms
+    st.defense_clusters = Gateway.Clusters
+    st.auto_recent = AutoRecent
 
     if acu then
         st.acu = { pos = { R(acu:GetPosition()[1]), R(acu:GetPosition()[3]) }, hp = R1(HpOf(acu)) }
@@ -356,10 +408,34 @@ function Handlers.release(ctx, a)
     Say(ctx, string.format('release: %d units handed back to the AI', table.getn(mine)))
 end
 
+-- Gateway ACU actions
+function Handlers.defense_cluster(ctx, a) Gateway.DefenseCluster(ctx, a) end
+function Handlers.mass_farm(ctx, a) Gateway.MassFarm(ctx, a) end
+function Handlers.experimental(ctx, a) Gateway.Experimental(ctx, a) end
+
+-- {"a":"sacu","cmd":"move|retreat|stop","x":..,"z":..}: move the gateway ACUs (they are owned by the LLM permanently)
+function Handlers.sacu(ctx, a)
+    local cmd = tostring(a.cmd)
+    if table.getn(ctx.sacus) == 0 then return Say(ctx, 'sacu: no gateway ACUs') end
+    if cmd == 'stop' then
+        IssueClearCommands(ctx.sacus)
+    elseif cmd == 'retreat' then
+        IssueClearCommands(ctx.sacus)
+        IssueMove(ctx.sacus, Vec(ctx.baseX, ctx.baseZ))
+    elseif cmd == 'move' and tonumber(a.x) and tonumber(a.z) then
+        IssueClearCommands(ctx.sacus)
+        IssueMove(ctx.sacus, Vec(tonumber(a.x), tonumber(a.z)))
+    else
+        return Say(ctx, 'sacu: cmd must be move (with x,z), retreat or stop')
+    end
+    Say(ctx, string.format('sacu %s: %d gateway ACUs', cmd, table.getn(ctx.sacus)))
+end
+
 function Execute(brain, actions, cfg)
     local bx, bz = brain:GetArmyStartPos()
     local ctx = { brain = brain, cfg = cfg, results = {}, now = GetGameTimeSeconds(), idx = brain:GetArmyIndex(),
-                  baseX = bx, baseZ = bz, all = brain:GetListOfUnits(categories.ALLUNITS, false, true) }
+                  baseX = bx, baseZ = bz, all = brain:GetListOfUnits(categories.ALLUNITS, false, true),
+                  faction = brain:GetFactionIndex(), sacus = SacuList() }
     local count = 0
     for _, a in ipairs(actions) do
         count = count + 1
@@ -369,7 +445,7 @@ function Execute(brain, actions, cfg)
         else
             local h = Handlers[a.a]
             if not h then
-                Say(ctx, 'unknown action "' .. a.a .. '" (micro mode: order, focus, scout, release)')
+                Say(ctx, 'unknown action "' .. a.a .. '" (micro mode: order, focus, scout, release, sacu, defense_cluster, mass_farm, experimental)')
             else
                 local ok, err = pcall(h, ctx, a)
                 if not ok then Say(ctx, a.a .. ' failed: ' .. tostring(err)) end
@@ -377,4 +453,67 @@ function Execute(brain, actions, cfg)
         end
     end
     return ctx.results, count
+end
+
+
+---------------------------------------------------------------------------------------------------
+-- GATEWAY AUTOPILOT. Same rules the LLM is told to follow, applied automatically when a gateway ACU is idle
+-- (Config.GatewayAuto = false turns it off):
+--   1. base defences lacking      -> defense_cluster (T3 shield, 10 SAMs, T2 artillery + T2 PD)
+--   2. mass is not being used     -> experimental (Tech 4 unit)
+--   3. otherwise, mass is short   -> mass_farm (T3 power plant ringed by T2 fabricators)
+---------------------------------------------------------------------------------------------------
+AutoRecent = {}
+local AutoCool, DefBlock, FarmBlock = 0, 0, 0
+
+local function ANote(now, msg)
+    table.insert(AutoRecent, 't' .. math.floor(now) .. ' ' .. msg)
+    while table.getn(AutoRecent) > 6 do table.remove(AutoRecent, 1) end
+end
+
+function Auto(brain, cfg, now)
+    if cfg.GatewayAuto == false or now < AutoCool then return end
+    local sacus = SacuList()
+    if table.getn(sacus) == 0 then return end
+    local idle = 0
+    for _, u in ipairs(sacus) do if u:IsIdleState() then idle = idle + 1 end end
+    if idle == 0 then return end
+
+    local mr, er = 0, 0
+    pcall(function() mr = brain:GetEconomyStoredRatio('MASS') er = brain:GetEconomyStoredRatio('ENERGY') end)
+    local bx, bz = brain:GetArmyStartPos()
+    local defs, expBuilding = {}, false
+    for _, u in ipairs(brain:GetListOfUnits(categories.ALLUNITS, false)) do
+        if not u.Dead then
+            local bpid = u:GetUnitId()
+            local s = K.CatSet(bpid)
+            if s.STRUCTURE then
+                local k = K.StructureKind(bpid)
+                if k == 'shield' or k == 'aa' or k == 'pd' or k == 'arty' then
+                    local p = u:GetPosition()
+                    if Dist(p[1], p[3], bx, bz) <= (cfg.DefenseRadius or 90) then defs[k] = (defs[k] or 0) + 1 end
+                end
+            elseif s.EXPERIMENTAL and s.MOBILE and u:GetFractionComplete() < 1 then
+                expBuilding = true
+            end
+        end
+    end
+    local lacking = (defs.shield or 0) == 0 or (defs.aa or 0) < 6 or ((defs.pd or 0) + (defs.arty or 0)) < 8
+
+    local act, why = nil, nil
+    if lacking and now >= DefBlock and Gateway.Clusters < (cfg.MaxDefenseClusters or 2) then
+        act, why = { a = 'defense_cluster', near = { bx, bz } }, 'base defences lacking'
+    elseif mr >= (cfg.StallMassRatio or 0.7) and not expBuilding then
+        act, why = { a = 'experimental', what = 'any', near = { bx, bz } }, 'mass not being used'
+    elseif mr < 0.5 and er >= 0.6 and now >= FarmBlock and Gateway.Farms < (cfg.MaxMassFarms or 3) then
+        act, why = { a = 'mass_farm', near = { bx, bz } }, 'need more mass'
+    end
+    if not act then return end
+
+    local c0, f0 = Gateway.Clusters, Gateway.Farms
+    local results = Execute(brain, { act }, cfg)
+    AutoCool = now + 45
+    if act.a == 'defense_cluster' and Gateway.Clusters == c0 then DefBlock = now + 300 end
+    if act.a == 'mass_farm' and Gateway.Farms == f0 then FarmBlock = now + 300 end
+    ANote(now, act.a .. ' (' .. why .. '): ' .. tostring(results[1]))
 end

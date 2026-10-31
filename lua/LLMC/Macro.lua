@@ -138,7 +138,7 @@ local UnitN = { tank = 4, artillery = 2, land_aa = 2, fighter = 5, bomber = 4, g
 ---------------------------------------------------------------------------------------------------
 function Tick(brain, cfg, now, rescue)
     local S = Actions.Strategy
-    if not S.macro and not rescue then Actions.HoldMass = false return end
+    if not S.macro and not rescue then return end
     if rescue then OpeningPhase = 3 end      -- no scripted opening when rescuing LOUD
 
     local c = Scan(brain, cfg)
@@ -185,30 +185,20 @@ function Tick(brain, cfg, now, rescue)
         return
     end
 
-    -- TECH PLAN + HOLD.  Mass goes to upgrading mass extractors first. While a mex upgrade is pending (waiting for
-    -- >50% stored mass, or running), or a factory upgrade is about to start / running, the macro does NOT spend mass on
-    -- engineers, extra factories, radar or army units: the factories are allowed to sit idle. A threat to the base
-    -- lifts the hold. (Power and mass buildings and the upgrades themselves are never held.)
+    -- TECH PLAN (factories only follow the mass extractors, see the tech rule below)
     local facBest = 1
     for _, k in ipairs({ 'land', 'air', 'naval' }) do
         if c.fac[k].best > facBest then facBest = c.fac[k].best end
     end
     local mexCap = math.min(S.tech, facBest + 1)
-    local mexNeed = cfg.MexUpgradeMassRatio or 0.5
     local wantMexUp = (c.mexMin < mexCap and c.mexMin < 9)
-    local facPending = false
+    local facPending = false     -- a factory upgrade is about to start (all mex are at the next tier)
     if c.facUpg == 0 then
         for _, k in ipairs({ 'land', 'air', 'naval' }) do
             local f = c.fac[k]
             if f.n > 0 and f.best > 0 and f.best < S.tech and c.mexMin >= f.best + 1 then facPending = true end
         end
     end
-    local st = LastState
-    local threatNow = 0
-    if st and st.enemy_near_base then threatNow = st.enemy_near_base.land + st.enemy_near_base.air + st.enemy_near_base.naval end
-    local holdMass = (cfg.PauseArmyForMexUpgrade ~= false) and threatNow == 0 and c.mex >= 3
-        and (wantMexUp or facPending or c.mexUpg > 0 or c.facUpg > 0)
-    Actions.HoldMass = holdMass
 
     -- 1. energy
     local energyShort = (enInc < enDem * 1.05) or enR < 0.3 or (rescue and massR > 0.6 and enR < 0.5)
@@ -219,10 +209,7 @@ function Tick(brain, cfg, now, rescue)
         Wait('fab', now, 20)
         Note(now, 'rescue: energy floating, building a mass fabricator')
     end
-    -- first 5 minutes: at most 1 power generator per 2 mass extractors (minimum 2)
-    local powerCap = 999
-    if now < (cfg.PowerRatioSeconds or 0) then powerCap = math.max(2, math.floor(c.mex / (cfg.MexPerPgen or 2))) end
-    if idleLeft > 0 and Ready('pgen', now) and c.pgen < powerCap and (c.pgen < 2 or (energyShort and c.pgen < 40) or (facPending and enR < (cfg.TechEnergyRatio or 0.98) and c.pgen < 40)) then
+    if idleLeft > 0 and Ready('pgen', now) and (c.pgen < 2 or (energyShort and c.pgen < 40) or (facPending and enR < (cfg.TechEnergyRatio or 0.98) and c.pgen < 40)) then
         Add({ a = 'build', what = 'pgen', n = 1, tech = S.tech, near = base, radius = 40, idle_only = true })
         idleLeft = idleLeft - 1
         Wait('pgen', now, 12)
@@ -250,7 +237,7 @@ function Tick(brain, cfg, now, rescue)
     if c.mex < 6 or now < 360 then wantAir = 0 end
     if wantLand > 0 then wantLand = wantLand + boost end
     if wantAir > 0 then wantAir = wantAir + boost end
-    if idleLeft > 0 and Ready('factory', now) and not ecoOnly and not holdMass then
+    if idleLeft > 0 and Ready('factory', now) and not ecoOnly then
         local what = nil
         if c.fac.land.n < wantLand then what = 'land_factory'
         elseif c.fac.air.n < wantAir then what = 'air_factory'
@@ -264,7 +251,7 @@ function Tick(brain, cfg, now, rescue)
     end
 
     -- 4. intel
-    if idleLeft > 0 and not ecoOnly and not holdMass and now > 150 and c.radar == 0 and c.mex >= 4 and Ready('radar', now) then
+    if idleLeft > 0 and not ecoOnly and now > 150 and c.radar == 0 and c.mex >= 4 and Ready('radar', now) then
         Add({ a = 'build', what = 'radar', n = 1, tech = 1, near = base, radius = 30, idle_only = true })
         idleLeft = idleLeft - 1
         Wait('radar', now, 90)
@@ -277,11 +264,12 @@ function Tick(brain, cfg, now, rescue)
     local mexSettled = (c.mex >= 3 and c.mexUpg == 0 and c.mexUnfinished == 0)
 
     local okFac = (enR >= (cfg.TechEnergyRatio or 0.98))   -- power storage full
-    -- Mex upgrades (T1->T2 and T2->T3): ONE AT A TIME, and only when stored mass is ABOVE 50% of capacity.
-    if wantMexUp and c.mex >= 3 and c.mexUpg == 0 and massR > mexNeed and Ready('upmex', now) then
+    -- Mex upgrades (T1->T2, T2->T3): whenever a mex is below the tier the factories allow (one tier ahead of them).
+    local okMex = (massR > 0.12 and enR > 0.3)
+    if okMex and wantMexUp and c.mex >= 3 and c.mexUpg < math.max(1, math.floor(c.mex / 4)) and Ready('upmex', now) then
         Add({ a = 'upgrade', what = 'mex', n = 1, from_tech = c.mexMin, max_tech = mexCap })
-        Wait('upmex', now, 15)
-        Note(now, 'upgrade mex T' .. c.mexMin .. ' (stored mass ' .. math.floor(massR * 100) .. '%)')
+        Wait('upmex', now, 8)
+        Note(now, 'upgrade mex T' .. c.mexMin)
     end
     if okFac and mexSettled and not ecoOnly and c.facUpg == 0 and Ready('upfac', now) then
         local pick, pickTech = nil, 99
@@ -314,20 +302,18 @@ function Tick(brain, cfg, now, rescue)
 
     -- 7. engineers
     local want = S.engineers
-    if want < 1 then want = math.min(8, 4 + math.floor(c.mex / 4)) end
-    if c.fac.land.n > 0 and c.engTotal < want and Ready('eng', now) and (not holdMass or c.engTotal < 2) and c.engIdleEng == 0 then   -- never while an engineer is idle
+    if want < 1 then want = math.min(16, 4 + math.floor(c.mex / 2)) end
+    if c.fac.land.n > 0 and c.engTotal < want and Ready('eng', now) and c.engIdleEng == 0 then   -- never while an engineer is idle
         Add({ a = 'produce', factory = 'land', what = 'engineer', n = math.min(2, want - c.engTotal), tech = 4 })
         Wait('eng', now, 25)
     end
 
     -- 8. army production: refill idle factories
-    -- While a mex upgrade is waiting for mass (and nothing threatens the base) do not spend the mass on units.
-    local saving = holdMass
     for _, k in ipairs({ 'land', 'air', 'naval' }) do
         local allowed = true
         if k == 'land' and S.army == 'air' then allowed = false end
         if k == 'air' and S.army == 'land' then allowed = false end
-        if allowed and not ecoOnly and not saving then
+        if allowed and not ecoOnly then
             for _, f in ipairs(c.fac[k].list) do
                 if f.queue == 0 and (k ~= 'land' or c.engTotal >= 2 or c.fac.land.n > 1) then
                     local rot = Rot[f.id] or 0
@@ -444,7 +430,7 @@ function Rescue(brain, cfg, now)
     end
 
     if RescueOn then
-        local rcfg = setmetatable({ EcoOnlySeconds = 0, PowerRatioSeconds = 0, PauseArmyForMexUpgrade = false }, { __index = cfg })
+        local rcfg = setmetatable({ EcoOnlySeconds = 0 }, { __index = cfg })
         Tick(brain, rcfg, now, true)
     end
     return RescueOn

@@ -33,6 +33,15 @@ Config = {
     -- Tell the LLM where enemy start positions are (a human sees the spawn markers too).
     RevealEnemyStarts = true,
 
+    -- micro mode QUANTUM GATEWAY: every ACU (SACU) the Quantum Gateway builds is taken from LOUD for good and belongs to
+    -- the LLM, which uses them for: defence clusters (T3 shield + 10 SAMs + T2 artillery/PD under it), Tech 4 units when
+    -- mass is not being used, and mass farms (T3 power plant ringed by 16 T2 fabricators). GatewayAuto applies those
+    -- rules automatically whenever a gateway ACU is idle (the LLM can still order them itself).
+    GatewayAuto = true,
+    MaxDefenseClusters = 2,
+    MaxMassFarms = 3,
+    DefenseRadius = 90,    -- structures within this distance of your start position count as "base defences"
+
     -- micro mode RESCUE: if the built-in AI stops building (idle engineers/factories) while stored mass >= StallMassRatio
     -- or stored energy >= StallEnergyRatio for StallSeconds, the macro manager spends the resources for it until they
     -- are being used again. Set Rescue = false to disable.
@@ -41,22 +50,9 @@ Config = {
     StallMassRatio = 0.7,
     StallEnergyRatio = 0.95,
 
-    -- Mex upgrades (T1->T2 and T2->T3): one at a time, and only when stored mass is ABOVE this fraction of mass
-    -- storage capacity (0.5 = 50%). Enforced for LLM orders too.
-    MexUpgradeMassRatio = 0.5,
-    -- While a mex upgrade is pending (or a factory upgrade is about to happen) the macro does not spend mass on engineers,
-    -- extra factories, radar or army units - factories may sit idle - unless the base is attacked. Applies to LLM
-    -- produce/build orders too. Set false to keep producing units.
-    PauseArmyForMexUpgrade = true,
-
     -- Idle engineers AND the idle ACU assist ONLY mass extractor upgrades and ACU upgrades. The ACU only helps
     -- when the target is within this many map units of it (needs UseACUToBuild = true).
     ACUAssistRadius = 200,
-
-    -- Early power limit: for the first PowerRatioSeconds of the game, build at most 1 power generator per
-    -- MexPerPgen mass extractors (never fewer than 2 generators; the opening's first 2 are exempt). 0 = off.
-    PowerRatioSeconds = 300,
-    MexPerPgen = 2,
 
     -- Economy-only opening: for this many game seconds the commander only builds economy (mex, power, engineers,
     -- the first land factory). No army, extra factories, radar, defences, tech-ups or attacks. 0 = off.

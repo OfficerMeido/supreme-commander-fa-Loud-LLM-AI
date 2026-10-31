@@ -64,6 +64,7 @@ SquadOrder = { 'scouts', 'fighters', 'bombers', 'gunships', 'naval', 'land', 'ai
 
 Recipes = {
     acu     = { all = {'COMMAND'} },
+    sacu    = { all = {'SUBCOMMANDER', 'MOBILE'} },   -- support ACUs (built by the Quantum Gateway)
     factory = { all = {'FACTORY', 'STRUCTURE'} },
     structure = { all = {'STRUCTURE'} },
 }
