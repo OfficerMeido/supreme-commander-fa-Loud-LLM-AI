@@ -4,6 +4,17 @@
 
 local K = import('/mods/LLMCommander/lua/LLMC/Kinds.lua')
 
+-- Strategy knobs (set by Config, changed by the LLM's "strategy" action, read by Macro.lua).
+Strategy = { macro = true, auto_attack = true, tech = 3, army = 'mixed', engineers = 0,
+    land_factories = 2, air_factories = 1, naval_factories = 0, attack_size = 20 }
+
+-- Economy-only opening: for the first Config.EcoOnlySeconds of game time only mass/power/engineer things are allowed
+-- (set Emergency = true by the Controller when the base is under heavy attack).
+Emergency = false
+local function EcoOnly(ctx)
+    return GetGameTimeSeconds() < (ctx.cfg.EcoOnlySeconds or 0) and not Emergency
+end
+
 -- Build spots reserved this/last minute so two engineers are not sent to the same tile.
 Reservations = {}
 
@@ -66,15 +77,17 @@ local function Engineers(ctx)
 end
 
 -- Engineers sorted best-first for a job at (x, z): close, idle, not the ACU, not already given work this turn.
-local function Ranked(ctx, x, z)
+local function Ranked(ctx, x, z, idleOnly, noACU)
     local out = {}
     for _, e in ipairs(Engineers(ctx)) do
+      if not (noACU and e.acu) and not (idleOnly and ((not e.unit:IsIdleState()) or ctx.load[e.unit])) then
         local p = e.unit:GetPosition()
         local score = Dist(p[1], p[3], x, z)
         if not e.unit:IsIdleState() then score = score + 150 + 25 * QueueLen(e.unit) end
         if e.acu then score = score + 300 end
         score = score + 80 * (ctx.load[e.unit] or 0)
         table.insert(out, { unit = e.unit, score = score })
+      end
     end
     table.sort(out, function(a, b) return a.score < b.score end)
     return out
@@ -167,6 +180,9 @@ end
 ---------------------------------------------------------------------------------------------------
 local Handlers = {}
 
+-- Structure kinds that may always be built (mass / power economy and storage).
+local FreeKinds = { mex = true, hydro = true, pgen = true, fabricator = true, mass_storage = true, energy_storage = true }
+
 function Handlers.build(ctx, a)
     local cands, kind
     if a.unit_id then
@@ -180,6 +196,24 @@ function Handlers.build(ctx, a)
         end
         cands = K.Candidates(K.Structures[kind], ctx.faction)
     end
+    local skind = a.unit_id and K.StructureKind(kind) or kind
+    if not FreeKinds[skind] and not (a.force and ctx.trusted) and EcoOnly(ctx) then
+        return Say(ctx, 'build ' .. kind .. ' skipped: economy-only phase (first ' .. math.floor((ctx.cfg.EcoOnlySeconds or 0) / 60) .. ' minutes). Build mex/power/engineers only.')
+    end
+    -- Storage gate: only mass / power buildings may be started when stored resources are low.
+    if not FreeKinds[skind] and not (a.force and ctx.trusted) then
+        local mr, er = 1, 1
+        pcall(function()
+            mr = ctx.brain:GetEconomyStoredRatio('MASS')
+            er = ctx.brain:GetEconomyStoredRatio('ENERGY')
+        end)
+        local needM, needE = ctx.cfg.MinMassRatio or 0.15, ctx.cfg.MinEnergyRatio or 0.25
+        if mr < needM or er < needE then
+            return Say(ctx, string.format('build %s skipped: not enough stored (mass %d%%, energy %d%%; need %d%% / %d%%). Build mex/power first.',
+                kind, mr * 100, er * 100, needM * 100, needE * 100))
+        end
+    end
+
     local n = Num(a.n, 1, 1, 12)
     local tech = Num(a.tech, 4, 1, 4)
     local cx, cz = ParseNear(ctx, a.near)
@@ -191,7 +225,7 @@ function Handlers.build(ctx, a)
     local placed, failed = 0, {}
     for i = 1, n do
         local did = false
-        for _, e in ipairs(Ranked(ctx, cx, cz)) do
+        for _, e in ipairs(Ranked(ctx, cx, cz, a.idle_only, a.no_acu)) do
             local bpid = K.BestBuildable(e.unit, cands, tech)
             if bpid and not failed[bpid] then
                 local x, z = FindSpot(ctx, bpid, cx, cz, radius, markers)
@@ -242,6 +276,10 @@ function Handlers.produce(ctx, a)
         end
         cands = K.Candidates(K.Units[kind], ctx.faction)
     end
+    local isEng = (kind == 'engineer') or (a.unit_id and K.Match(K.Units.engineer, kind))
+    if not isEng and EcoOnly(ctx) then
+        return Say(ctx, 'produce ' .. kind .. ' skipped: economy-only phase (engineers only)')
+    end
     local n = Num(a.n, 1, 1, 30)
     local tech = Num(a.tech, 4, 1, 4)
     local capable = {}
@@ -266,6 +304,24 @@ function Handlers.produce(ctx, a)
     Say(ctx, string.format('produce %s: %d queued across %d factories', kind, queued, cnt))
 end
 
+-- State of all our mass extractors (for the factory tech gate).
+local function MexStatus(ctx)
+    local ms = { total = 0, min = 9, upgrading = 0, unfinished = 0 }
+    for _, u in ipairs(ctx.brain:GetListOfUnits(categories.ALLUNITS, false)) do
+        if not u.Dead then
+            local bpid = u:GetUnitId()
+            if K.CatSet(bpid).MASSEXTRACTION and K.CatSet(bpid).STRUCTURE then
+                ms.total = ms.total + 1
+                local t = K.TechOf(bpid)
+                if t < ms.min then ms.min = t end
+                if u:GetFractionComplete() < 1 then ms.unfinished = ms.unfinished + 1 end
+                if u:IsUnitState('Upgrading') then ms.upgrading = ms.upgrading + 1 end
+            end
+        end
+    end
+    return ms
+end
+
 function Handlers.upgrade(ctx, a)
     local list = {}
     if a.id then
@@ -284,18 +340,41 @@ function Handlers.upgrade(ctx, a)
         end)
     end
     local n = Num(a.n, 1, 1, 12)
+    local from, maxT = tonumber(a.from_tech), tonumber(a.max_tech)
     local done = 0
+
+    -- FACTORY TECH GATE: a factory may only go up a tech level when EVERY mass extractor is already at the
+    -- new level (none upgrading / under construction) and energy storage is full.
+    local ms = MexStatus(ctx)
+    local er = 1
+    pcall(function() er = ctx.brain:GetEconomyStoredRatio('ENERGY') end)
+    local needE = ctx.cfg.TechEnergyRatio or 0.98
+    local why = nil
+    local function GateOK(bpid)
+        if K.CatSet(bpid).MASSEXTRACTION then return true end
+        if EcoOnly(ctx) then why = 'economy-only phase' return false end
+        local nextT = K.TechOf(bpid) + 1
+        if ms.total == 0 then why = 'no mass extractors' return false end
+        if ms.unfinished > 0 or ms.upgrading > 0 then why = 'mass extractors still upgrading or being built' return false end
+        if ms.min < nextT then why = 'not all mass extractors are T' .. nextT .. ' yet (lowest is T' .. ms.min .. ')' return false end
+        if er < needE then why = string.format('energy storage %d%% (need %d%%)', er * 100, needE * 100) return false end
+        return true
+    end
     for _, u in ipairs(list) do
         if done >= n then break end
-        local bp = u:GetBlueprint()
-        local up = bp.General and bp.General.UpgradesTo
-        if up and up ~= '' and not u:IsUnitState('Upgrading') and u:CanBuild(up)
-           and (K.CatSet(u:GetUnitId()).MASSEXTRACTION or u:IsIdleState()) then
+        local bpid = u:GetUnitId()
+        local cur = K.TechOf(bpid)
+        local up = u:GetBlueprint().General and u:GetBlueprint().General.UpgradesTo
+        if up and up ~= '' and (not from or cur == from) and (not maxT or cur < maxT)
+           and not u:IsUnitState('Upgrading') and u:CanBuild(up) and GateOK(bpid) then
+            -- factories are almost always busy building units: drop the queue so the upgrade can start
+            if not K.CatSet(bpid).MASSEXTRACTION and not u:IsIdleState() then IssueClearCommands({ u }) end
             IssueUpgrade({ u }, up)
             done = done + 1
         end
     end
-    Say(ctx, string.format('upgrade %s: %d started', tostring(a.what or a.id), done))
+    Say(ctx, string.format('upgrade %s: %d started%s', tostring(a.what or a.id), done,
+        (done == 0 and why) and (' - blocked: ' .. why) or ''))
 end
 
 function Handlers.assist(ctx, a)
@@ -304,7 +383,7 @@ function Handlers.assist(ctx, a)
     local tp = target:GetPosition()
     local n = Num(a.n, 2, 1, 20)
     local sent = {}
-    for _, e in ipairs(Ranked(ctx, tp[1], tp[3])) do
+    for _, e in ipairs(Ranked(ctx, tp[1], tp[3], a.idle_only ~= false)) do
         if table.getn(sent) >= n then break end
         table.insert(sent, e.unit)
     end
@@ -325,7 +404,7 @@ function Handlers.reclaim(ctx, a)
         end
     end
     table.sort(good, function(p, q) return p.m > q.m end)
-    local engs = Ranked(ctx, cx, cz)
+    local engs = Ranked(ctx, cx, cz, a.idle_only ~= false)
     local sent = 0
     for i = 1, math.min(n, table.getn(good), table.getn(engs)) do
         IssueReclaim({ engs[i].unit }, good[i].prop)
@@ -348,6 +427,20 @@ function Handlers.enhance(ctx, a)
     end
     IssueScript({ acu }, { TaskName = 'EnhanceTask', Enhancement = name })
     Say(ctx, 'enhance: started ' .. name)
+end
+
+function Handlers.strategy(ctx, a)
+    local S = Strategy
+    if a.tech ~= nil then S.tech = Num(a.tech, S.tech, 1, 3) end
+    if a.army == 'land' or a.army == 'air' or a.army == 'mixed' then S.army = a.army end
+    if a.engineers ~= nil then S.engineers = Num(a.engineers, 0, 0, 30) end
+    if a.land_factories ~= nil then S.land_factories = Num(a.land_factories, 2, 0, 8) end
+    if a.air_factories ~= nil then S.air_factories = Num(a.air_factories, 1, 0, 8) end
+    if a.naval_factories ~= nil then S.naval_factories = Num(a.naval_factories, 0, 0, 6) end
+    if a.attack_size ~= nil then S.attack_size = Num(a.attack_size, 20, 5, 150) end
+    if a.macro ~= nil then S.macro = a.macro and true or false end
+    if a.auto_attack ~= nil then S.auto_attack = a.auto_attack and true or false end
+    Say(ctx, 'strategy updated')
 end
 
 function Handlers.rally(ctx, a)
@@ -419,10 +512,10 @@ function Handlers.scout(ctx, a)   SquadOrder(ctx, a, 'scout') end
 ---------------------------------------------------------------------------------------------------
 -- Entry point
 ---------------------------------------------------------------------------------------------------
-function Execute(brain, actions, cfg)
+function Execute(brain, actions, cfg, trusted)
     local bx, bz = brain:GetArmyStartPos()
     local ctx = {
-        brain = brain, cfg = cfg, results = {}, load = {},
+        brain = brain, cfg = cfg, results = {}, load = {}, trusted = trusted,
         faction = brain:GetFactionIndex(), baseX = bx, baseZ = bz,
         all = brain:GetListOfUnits(categories.ALLUNITS, false, true),
         units = {},

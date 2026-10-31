@@ -8,6 +8,7 @@ local Json    = import('/mods/LLMCommander/lua/LLMC/Json.lua')
 local Cfg     = import('/mods/LLMCommander/lua/LLMC/Config.lua').Config
 local State   = import('/mods/LLMCommander/lua/LLMC/State.lua')
 local Actions = import('/mods/LLMCommander/lua/LLMC/Actions.lua')
+local Macro   = import('/mods/LLMCommander/lua/LLMC/Macro.lua')
 
 local Started = false
 local TargetName = nil
@@ -63,6 +64,10 @@ function Main()
     local sid = math.floor(Random() * 1000000) + 1
     local seq, lastExec, lastSent, nextSend = 0, 0, -1000, 0
     local pending = false
+    local nextMacro = 0
+    local S = Actions.Strategy
+    S.macro, S.auto_attack, S.tech = Cfg.Macro, Cfg.AutoAttack, Cfg.TechTarget
+    S.attack_size, S.land_factories, S.air_factories = Cfg.AttackSize, Cfg.LandFactories, Cfg.AirFactories
     local lastResults = {}
     LOG('LLMC|I|START|' .. sid)
     LOG('LLMC|I|INFO controlling ' .. name .. ' (' .. tostring(brain.Nickname) .. ')')
@@ -95,11 +100,26 @@ function Main()
             pending = false
         end
 
+        -- 1b. automatic macro (eco, tech, production, waves) - independent of LLM latency
+        if now >= nextMacro then
+            nextMacro = now + Cfg.MacroInterval
+            local mok, merr = pcall(Macro.Tick, brain, Cfg, now)
+            if not mok then WARN('LLMC macro error: ' .. tostring(merr)) end
+        end
+
         -- 2. send a new observation
         if (not pending and now >= nextSend) or (pending and now - lastSent > Cfg.ResendAfter) then
             seq = seq + 1
             local ok, st = pcall(State.Build, brain, Cfg, seq, sid, now, lastResults)
             if ok then
+                st.strategy = Actions.Strategy
+                local nb = st.enemy_near_base
+                Actions.Emergency = (Cfg.EcoOnlyEmergency and nb and (nb.land + nb.air + nb.naval) >= 4) and true or false
+                if now < Cfg.EcoOnlySeconds and not Actions.Emergency then
+                    st.economy_only_until = Cfg.EcoOnlySeconds
+                end
+                st.macro_recent = Macro.Recent
+                Macro.SetState(st)
                 Json.LogChunks('S', seq, Json.Encode(st))
                 pending = true
                 lastSent = now
