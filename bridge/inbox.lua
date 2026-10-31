@@ -1,2 +1,1 @@
--- Written by llm_bridge.py. Do not edit. (File must exist so the game can read it.)
-LLMC_INBOX = { sid = 0, seq = 0, actions = {}, warnings = {} }
+LLMC_INBOX = { sid = 89914, seq = 35, actions = {{["a"]="build",["what"]="hydro",["n"]=2,["tech"]=1,["near"]={900,344},["radius"]=30},{["a"]="produce",["factory"]="land",["what"]="tank",["n"]=10,["tech"]=1},{["a"]="produce",["factory"]="land",["what"]="artillery",["n"]=5,["tech"]=1},{["a"]="scout",["x"]=166,["z"]=652}}, warnings = {} }
