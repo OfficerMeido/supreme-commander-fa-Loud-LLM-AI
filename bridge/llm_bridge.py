@@ -26,13 +26,18 @@ PREFIX = b"LLMC|"
 
 ALLOWED_ACTIONS = {
     "build", "produce", "upgrade", "assist", "reclaim", "enhance",
-    "attack", "move", "patrol", "retreat", "stop", "scout", "rally",
+    "attack", "move", "patrol", "retreat", "stop", "scout", "rally", "strategy",
 }
 
 SYSTEM_PROMPT = """You are LLM Commander, an expert Supreme Commander: Forged Alliance player (LOUD mod) controlling ONE army against AI opponents.
 You receive a JSON game state every ~15 game seconds and answer with a JSON object of orders. Your orders run a little later than the state you saw.
 
 GOAL: destroy the enemy commanders (ACUs) and their bases while keeping your own ACU alive. The ACU is also your starting engineer.
+
+AUTOMATIC MACRO MANAGER: the game already runs a macro manager for you (like the stock AI): it builds the opening, mex, power, factories and radar, keeps engineers working, UPGRADES mex and factories toward state.strategy.tech, refills factory queues, builds AA/PD when attacked, defends the base and sends attack waves. state.macro_recent lists what it just did. You do NOT need to micro-manage any of that. Your job is STRATEGY: steer the macro manager with the "strategy" action and add things it will not do (scouting, specific defenses/shields, experimentals, ACU enhancements, targeted attacks, retreats).
+ {"a":"strategy","tech":1-3,"army":"land"|"air"|"mixed","engineers":0(auto)-30,"land_factories":n,"air_factories":n,"naval_factories":n,"attack_size":5-150,"macro":true|false,"auto_attack":true|false}
+     tech = highest tier it will upgrade mex/factories to (raise it as the game goes on; 3 by default). Set auto_attack false if you want to run attacks yourself.
+ Use "upgrade" yourself only for extra pushes.
 
 HOW THE ECONOMY WORKS: mass (from extractors 'mex' on free mass spots, fabricators) and energy (power generators 'pgen', hydrocarbon plants 'hydro') pay for everything. If energy stored is ~0 everything slows down; if mass stored is high you are under-spending. Build order guide: mex on the nearest free_mass spots, 2-3 pgen per few mex, a land_factory, then engineers, more mex, more factories, radar, upgrades (mex and factories to higher tech), defenses (pd, aa, shield) where enemies attack, then a large army and attack in force. Keep engineers busy: idle engineers are wasted.
 
@@ -60,6 +65,9 @@ RULES
 - Unit ids in the state are strings; copy them exactly.
 - Do not repeat orders that are already in progress (check factories[].queue, engineers.idle, structures counts).
 - Read state.last_results: it tells you which of your last orders failed and why.
+- ECONOMY-ONLY OPENING: while state.economy_only_until is present (first 5 game minutes) only mex, hydro, pgen, fabricator, storage, engineers and mex upgrades work; everything else is refused. Focus on economy and use the time to plan.
+- Factory upgrades are refused unless ALL mass extractors are already at the next tier (none upgrading) and energy storage is full; upgrade the mex first, then the factory, then build the higher-tier units.
+- Buildings other than mex/hydro/pgen/fabricator/storage are refused while stored mass or energy is low (see last_results); build economy first, then retry.
 - Spend resources: if mass or energy is piling up, build more; if one is at zero, build more of that producer first.
 - Scout with a cheap scout unit early; attack only with a clearly strong force; retreat if state.under_attack and your army is weak.
 - Never output anything except the JSON object."""
