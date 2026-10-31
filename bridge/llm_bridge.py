@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 
+BRIDGE_VERSION = 4
 PREFIX = b"LLMC|"
 
 ALLOWED_ACTIONS = {
@@ -70,7 +71,7 @@ RULES
 - Buildings other than mex/hydro/pgen/fabricator/storage are refused while stored mass or energy is low (see last_results); build economy first, then retry.
 - Spend resources: if mass or energy is piling up, build more; if one is at zero, build more of that producer first.
 - Scout with a cheap scout unit early; attack only with a clearly strong force; retreat if state.under_attack and your army is weak.
-- Never output anything except the JSON object."""
+- Never output anything except the JSON object. Be concise: thoughts under 15 words, notes under 200 characters, at most 16 actions, no comments, no trailing commas."""
 
 SAMPLE_STATE = {
     "seq": 1, "sid": 1, "t": 20, "faction": "UEF", "base": [100, 100], "map": {"w": 512, "h": 512},
@@ -173,6 +174,7 @@ class LLM:
     def __init__(self, args):
         self.args = args
         self.json_mode = not args.no_json_mode
+        self.last_finish = None
 
     def chat(self, messages):
         a = self.args
@@ -188,29 +190,88 @@ class LLM:
                                      data=json.dumps(body).encode(), headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=a.timeout) as r:
-                data = json.load(r)
+                body_bytes = r.read()
+            try:
+                data = json.loads(body_bytes.decode("utf-8", "replace"))
+            except ValueError:
+                raise RuntimeError("LLM SERVER sent a non-JSON HTTP body (starts: %r)" % body_bytes[:150])
         except urllib.error.HTTPError as e:
             if e.code == 400 and self.json_mode:
                 print("[bridge] server rejected response_format; retrying without JSON mode")
                 self.json_mode = False
                 return self.chat(messages)
             raise
-        return data["choices"][0]["message"].get("content") or ""
+        choice = data["choices"][0]
+        self.last_finish = choice.get("finish_reason")
+        return choice["message"].get("content") or ""
+
+
+def salvage(text):
+    """Last resort for broken JSON: pull the thoughts/notes strings and every complete action object we can parse."""
+    dec = json.JSONDecoder()
+    out = {"thoughts": "", "notes": "", "actions": []}
+    for key in ("thoughts", "notes"):
+        m = re.search(r'"%s"\s*:\s*"((?:\\.|[^"\\])*)"' % key, text)
+        if m:
+            out[key] = m.group(1)
+    m = re.search(r'"actions"\s*:\s*\[', text)
+    if not m:
+        return None
+    pos = m.end()
+    while pos < len(text):
+        c = text[pos]
+        if c == "{":
+            try:
+                obj, end = dec.raw_decode(text, pos)
+                if isinstance(obj, dict):
+                    out["actions"].append(obj)
+                pos = end
+                continue
+            except json.JSONDecodeError:
+                nxt = text.find("{", pos + 1)
+                if nxt < 0:
+                    break
+                pos = nxt
+                continue
+        if c == "]":
+            break
+        pos += 1
+    return out
 
 
 def extract_json(text):
+    """-> (object, note). Tolerates think-tags, code fences, trailing/missing commas and truncated replies."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    text = re.sub(r"^.*?</think>", "", text, flags=re.S).strip()   # unterminated opening tag
     m = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
     if m:
         text = m.group(1)
-    s, e = text.find("{"), text.rfind("}")
-    if s < 0 or e <= s:
+    s_, e_ = text.find("{"), text.rfind("}")
+    if s_ < 0:
         raise ValueError("no JSON object in reply")
-    raw = text[s:e + 1]
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return json.loads(re.sub(r",\s*([}\]])", r"\1", raw))  # trailing commas
+    raw = text[s_:e_ + 1] if e_ > s_ else text[s_:]
+    attempts = [
+        raw,
+        re.sub(r",\s*([}\]])", r"\1", raw),                                     # trailing commas
+        re.sub(r'(["\d\]}el])\s*\n\s*(")', r"\1,\n\2", re.sub(r"}\s*{", "},{", raw)),  # missing commas
+    ]
+    # comments, Python literals, trailing/missing commas all at once
+    c = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
+    c = re.sub(r"(?m)\s//[^\n]*$", "", c)
+    c = re.sub(r":\s*True\b", ": true", c)
+    c = re.sub(r":\s*False\b", ": false", c)
+    c = re.sub(r":\s*None\b", ": null", c)
+    c = re.sub(r",\s*([}\]])", r"\1", re.sub(r"}\s*{", "},{", c))
+    attempts.append(c)
+    for a in attempts:
+        try:
+            return json.loads(a), ""
+        except json.JSONDecodeError:
+            pass
+    got = salvage(text[s_:])
+    if got is not None and got["actions"]:
+        return got, f"reply was malformed JSON; recovered {len(got['actions'])} actions"
+    raise ValueError("reply was not valid JSON")
 
 
 # ------------------------------------------------------------------------------------------------
@@ -317,16 +378,46 @@ class Bridge:
         sysmsg = SYSTEM_PROMPT + (("\n\n" + self.extra) if self.extra else "")
         return [{"role": "system", "content": sysmsg}, {"role": "user", "content": user}]
 
-    def decide(self, state):
-        """One LLM round-trip -> (thoughts, notes, actions, warnings)."""
-        warnings = []
-        text = self.llm.chat(self.messages(state))
+    def log_bad(self, text, err):
         try:
-            obj = extract_json(text)
+            path = os.path.join(os.path.dirname(os.path.abspath(self.args.inbox)), "bad_replies.log")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("=== %s  %s\n%s\n\n" % (time.strftime("%H:%M:%S"), err, text))
+        except OSError:
+            pass
+
+    def decide(self, state):
+        """One LLM round-trip (plus one repair retry) -> (thoughts, notes, actions, warnings)."""
+        warnings = []
+        msgs = self.messages(state)
+        text = self.llm.chat(msgs)
+        truncated = self.llm.last_finish == "length"
+        try:
+            obj, note = extract_json(text)
         except ValueError as e:
+            self.log_bad(text, e)
             if self.args.verbose:
-                print("[llm raw]", text[:800])
-            raise
+                print("[llm raw]", text[:1200])
+            print(f"[bridge] unusable reply ({e}{', cut off by max_tokens' if truncated else ''}); asking the model to redo it")
+            retry = msgs + [
+                {"role": "assistant", "content": text[:3000]},
+                {"role": "user", "content": "That was not valid JSON" + (" (it was cut off - be much shorter)" if truncated else "") +
+                 ". Reply again with ONLY one valid JSON object: {\"thoughts\":\"...\",\"notes\":\"...\",\"actions\":[...]}. "
+                 "Keep thoughts under 15 words and use at most 12 actions."},
+            ]
+            text = self.llm.chat(retry)
+            truncated = self.llm.last_finish == "length"
+            try:
+                obj, note = extract_json(text)          # raises if still broken
+            except ValueError as e2:
+                self.log_bad(text, e2)
+                raise ValueError(f"reply still not valid JSON after retry ({e2}); see bridge/bad_replies.log")
+        if note:
+            warnings.append(note)
+            print("[bridge]", note)
+        if truncated:
+            warnings.append("reply was cut off by the token limit; keep replies shorter")
+            print("[bridge] reply hit max_tokens - consider raising --max-tokens")
         acts = sanitize_actions(obj.get("actions", []), warnings, self.args.max_actions)
         notes = str(obj.get("notes", ""))[:400]
         return str(obj.get("thoughts", ""))[:300], notes, acts, warnings
@@ -342,7 +433,7 @@ class Bridge:
             try:
                 thoughts, notes, acts, warnings = self.decide(state)
             except Exception as e:  # network error, bad JSON, ...
-                print(f"[bridge] turn {seq}: LLM call failed: {e}")
+                print(f"[bridge] turn {seq}: LLM call failed: {type(e).__name__}: {e}")
                 write_inbox(self.args.inbox, state.get("sid", 0), seq, [],
                             [f"your last reply was unusable ({str(e)[:60]}); reply with ONE valid JSON object"])
                 done = seq
@@ -372,7 +463,7 @@ class Bridge:
             sys.exit("Could not find the game log. Pass --log <path> (the file given to the game with /log).")
         if not os.path.exists(a.inbox):
             sys.exit(f"inbox file not found: {a.inbox}\nPass --inbox <path to LLMCommander/bridge/inbox.lua>")
-        print(f"[bridge] log:    {log}\n[bridge] inbox:  {a.inbox}\n[bridge] server: {a.server}")
+        print(f"[bridge] llm_bridge v{BRIDGE_VERSION}\n[bridge] log:    {log}\n[bridge] inbox:  {a.inbox}\n[bridge] server: {a.server}")
         threading.Thread(target=self.worker, daemon=True).start()
         for line in tail_lines(log, from_start=a.from_start):
             self.asm.feed(line)
@@ -400,7 +491,7 @@ def main():
     p.add_argument("--model", default="", help="model name (needed by Ollama / LM Studio, ignored by llama-server)")
     p.add_argument("--api-key", default="")
     p.add_argument("--temperature", type=float, default=0.4)
-    p.add_argument("--max-tokens", type=int, default=1200)
+    p.add_argument("--max-tokens", type=int, default=2500)
     p.add_argument("--timeout", type=float, default=300)
     p.add_argument("--max-actions", type=int, default=24)
     p.add_argument("--no-json-mode", action="store_true", help="do not send response_format=json_object")
