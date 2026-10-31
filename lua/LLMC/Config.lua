@@ -6,9 +6,17 @@ Config = {
     --   number : that army number, e.g. 2  ->  ARMY_2
     Army = 'auto',
 
-    -- 'replace' : the chosen AI slot's built-in (LOUD) AI is switched off, the LLM is its only brain.
-    -- 'overlay' : the built-in AI keeps running and the LLM just adds orders (they will fight over units).
-    Takeover = 'replace',
+    -- 'micro'   : (default) the built-in LOUD AI plays the whole game - economy, tech, base, production, its own
+    --             attack plans. The LLM only MICRO-MANAGES combat units: it takes selected units from the AI for
+    --             a short time, gives tactical orders, and they go back to the AI automatically.
+    -- 'replace' : the chosen AI slot's built-in (LOUD) AI is switched off; the LLM + the macro manager play.
+    -- 'overlay' : like 'replace' but the built-in AI is left running (they will fight over units).
+    Takeover = 'micro',
+
+    -- micro mode: game seconds between observations, and how long units stay under LLM control without a new order
+    -- before they are handed back to the AI.
+    MicroInterval = 8,
+    MicroHoldSeconds = 40,
 
     -- Game seconds between observations sent to the LLM.
     StateInterval = 15,
@@ -24,6 +32,31 @@ Config = {
 
     -- Tell the LLM where enemy start positions are (a human sees the spawn markers too).
     RevealEnemyStarts = true,
+
+    -- micro mode RESCUE: if the built-in AI stops building (idle engineers/factories) while stored mass >= StallMassRatio
+    -- or stored energy >= StallEnergyRatio for StallSeconds, the macro manager spends the resources for it until they
+    -- are being used again. Set Rescue = false to disable.
+    Rescue = true,
+    StallSeconds = 20,
+    StallMassRatio = 0.7,
+    StallEnergyRatio = 0.95,
+
+    -- Mex upgrades (T1->T2 and T2->T3): one at a time, and only when stored mass is ABOVE this fraction of mass
+    -- storage capacity (0.5 = 50%). Enforced for LLM orders too.
+    MexUpgradeMassRatio = 0.5,
+    -- While a mex upgrade is pending (or a factory upgrade is about to happen) the macro does not spend mass on engineers,
+    -- extra factories, radar or army units - factories may sit idle - unless the base is attacked. Applies to LLM
+    -- produce/build orders too. Set false to keep producing units.
+    PauseArmyForMexUpgrade = true,
+
+    -- Idle engineers AND the idle ACU assist ONLY mass extractor upgrades and ACU upgrades. The ACU only helps
+    -- when the target is within this many map units of it (needs UseACUToBuild = true).
+    ACUAssistRadius = 200,
+
+    -- Early power limit: for the first PowerRatioSeconds of the game, build at most 1 power generator per
+    -- MexPerPgen mass extractors (never fewer than 2 generators; the opening's first 2 are exempt). 0 = off.
+    PowerRatioSeconds = 300,
+    MexPerPgen = 2,
 
     -- Economy-only opening: for this many game seconds the commander only builds economy (mex, power, engineers,
     -- the first land factory). No army, extra factories, radar, defences, tech-ups or attacks. 0 = off.

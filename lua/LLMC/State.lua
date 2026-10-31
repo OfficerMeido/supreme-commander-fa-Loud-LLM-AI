@@ -31,7 +31,7 @@ local function QueueLen(u)
 end
 
 -- Everything the army can currently see/sense of the enemy, clustered into ~48-unit grid cells.
-local function ScanEnemies(brain, idx, baseX, baseZ, radius)
+function ScanEnemies(brain, idx, baseX, baseZ, radius)
     local res = { clusters = {}, near_base = { land = 0, air = 0, naval = 0 }, radar_blips = 0 }
     local grid = {}
     pcall(function()

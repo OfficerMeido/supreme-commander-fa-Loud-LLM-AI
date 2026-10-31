@@ -11,12 +11,47 @@ Strategy = { macro = true, auto_attack = true, tech = 3, army = 'mixed', enginee
 -- Economy-only opening: for the first Config.EcoOnlySeconds of game time only mass/power/engineer things are allowed
 -- (set Emergency = true by the Controller when the base is under heavy attack).
 Emergency = false
+HoldMass = false   -- set by Macro.lua: mass is reserved for mex/factory upgrades, so no engineers/army/extra factories
 local function EcoOnly(ctx)
     return GetGameTimeSeconds() < (ctx.cfg.EcoOnlySeconds or 0) and not Emergency
 end
 
 -- Build spots reserved this/last minute so two engineers are not sent to the same tile.
 Reservations = {}
+
+-- Power-generator orders issued but possibly not started yet: { x, z, t }. Used by the early-game power limit.
+PgenOrders = {}
+
+-- (mass extractors, power generators) counted INCLUDING structures under construction and orders not started yet.
+local function PowerCount(ctx)
+    local now = GetGameTimeSeconds()
+    local mex, pw, pos = 0, 0, {}
+    for _, u in ipairs(ctx.brain:GetListOfUnits(categories.ALLUNITS, false)) do
+        if not u.Dead then
+            local bpid = u:GetUnitId()
+            if K.CatSet(bpid).STRUCTURE then
+                local k = K.StructureKind(bpid)
+                if k == 'mex' then mex = mex + 1
+                elseif k == 'pgen' or k == 'hydro' then
+                    pw = pw + 1
+                    table.insert(pos, u:GetPosition())
+                end
+            end
+        end
+    end
+    local keep, pending = {}, 0
+    for _, e in ipairs(PgenOrders) do
+        if now - e.t < 200 then
+            local matched = false
+            for _, p in ipairs(pos) do
+                if math.abs(p[1] - e.x) < 4 and math.abs(p[3] - e.z) < 4 then matched = true end
+            end
+            if not matched then pending = pending + 1 table.insert(keep, e) end
+        end
+    end
+    PgenOrders = keep
+    return mex, pw + pending
+end
 
 local function Num(v, def, lo, hi)
     v = tonumber(v)
@@ -86,7 +121,7 @@ local function Ranked(ctx, x, z, idleOnly, noACU)
         if not e.unit:IsIdleState() then score = score + 150 + 25 * QueueLen(e.unit) end
         if e.acu then score = score + 300 end
         score = score + 80 * (ctx.load[e.unit] or 0)
-        table.insert(out, { unit = e.unit, score = score })
+        table.insert(out, { unit = e.unit, score = score, acu = e.acu })
       end
     end
     table.sort(out, function(a, b) return a.score < b.score end)
@@ -200,6 +235,9 @@ function Handlers.build(ctx, a)
     if not FreeKinds[skind] and not (a.force and ctx.trusted) and EcoOnly(ctx) then
         return Say(ctx, 'build ' .. kind .. ' skipped: economy-only phase (first ' .. math.floor((ctx.cfg.EcoOnlySeconds or 0) / 60) .. ' minutes). Build mex/power/engineers only.')
     end
+    if not FreeKinds[skind] and HoldMass and not ctx.trusted and not Emergency then
+        return Say(ctx, 'build ' .. kind .. ' skipped: mass is reserved for mass extractor / factory upgrades')
+    end
     -- Storage gate: only mass / power buildings may be started when stored resources are low.
     if not FreeKinds[skind] and not (a.force and ctx.trusted) then
         local mr, er = 1, 1
@@ -215,6 +253,20 @@ function Handlers.build(ctx, a)
     end
 
     local n = Num(a.n, 1, 1, 12)
+
+    -- EARLY POWER LIMIT: during the first PowerRatioSeconds (5 min) build at most 1 power generator per
+    -- MexPerPgen (2) mass extractors (the scripted opening's first 2 generators are exempt).
+    if (skind == 'pgen' or skind == 'hydro') and GetGameTimeSeconds() < (ctx.cfg.PowerRatioSeconds or 0)
+       and not (a.force and ctx.trusted) then
+        local mexN, pwN = PowerCount(ctx)
+        local allowed = math.max(2, math.floor(mexN / (ctx.cfg.MexPerPgen or 2)))
+        if pwN >= allowed then
+            return Say(ctx, string.format('build %s skipped: early game allows 1 power generator per %d mass extractors (%d mex, %d generators). Build mass extractors first.',
+                kind, ctx.cfg.MexPerPgen or 2, mexN, pwN))
+        end
+        n = math.min(n, allowed - pwN)
+    end
+
     local tech = Num(a.tech, 4, 1, 4)
     local cx, cz = ParseNear(ctx, a.near)
     local isMarker = (kind == 'mex' or kind == 'hydro')
@@ -231,6 +283,7 @@ function Handlers.build(ctx, a)
                 local x, z = FindSpot(ctx, bpid, cx, cz, radius, markers)
                 if x then
                     IssueBuildMobile({ e.unit }, Vec(x, z), bpid, {})
+                    if skind == 'pgen' or skind == 'hydro' then table.insert(PgenOrders, { x = x, z = z, t = GetGameTimeSeconds() }) end
                     ctx.load[e.unit] = (ctx.load[e.unit] or 0) + 1
                     placed = placed + 1
                     did = true
@@ -280,6 +333,16 @@ function Handlers.produce(ctx, a)
     if not isEng and EcoOnly(ctx) then
         return Say(ctx, 'produce ' .. kind .. ' skipped: economy-only phase (engineers only)')
     end
+    if isEng and not ctx.trusted then
+        for _, e in ipairs(K.Select(ctx.all, K.Units.engineer)) do
+            if e:IsIdleState() then
+                return Say(ctx, 'produce engineer skipped: an engineer is idle - give it work (or let it assist an upgrade) instead of building more')
+            end
+        end
+    end
+    if HoldMass and not ctx.trusted and not Emergency then
+        return Say(ctx, 'produce ' .. kind .. ' skipped: mass is reserved for mass extractor / factory upgrades (the factory should stay idle)')
+    end
     local n = Num(a.n, 1, 1, 30)
     local tech = Num(a.tech, 4, 1, 4)
     local capable = {}
@@ -303,6 +366,8 @@ function Handlers.produce(ctx, a)
     end
     Say(ctx, string.format('produce %s: %d queued across %d factories', kind, queued, cnt))
 end
+
+LastMexUpg = -100   -- game time of the last mex upgrade we started (one at a time)
 
 -- State of all our mass extractors (for the factory tech gate).
 local function MexStatus(ctx)
@@ -349,9 +414,22 @@ function Handlers.upgrade(ctx, a)
     local er = 1
     pcall(function() er = ctx.brain:GetEconomyStoredRatio('ENERGY') end)
     local needE = ctx.cfg.TechEnergyRatio or 0.98
+    local mr = 1
+    pcall(function() mr = ctx.brain:GetEconomyStoredRatio('MASS') end)
+    local needMex = ctx.cfg.MexUpgradeMassRatio or 0.5
     local why = nil
     local function GateOK(bpid)
-        if K.CatSet(bpid).MASSEXTRACTION then return true end
+        if K.CatSet(bpid).MASSEXTRACTION then
+            -- MEX RULES: one at a time; T1->T2 and T2->T3 only when stored mass is above MexUpgradeMassRatio (50%).
+            if ms.upgrading > 0 or GetGameTimeSeconds() - LastMexUpg < 10 then
+                why = 'another mass extractor is already upgrading (one at a time)' return false
+            end
+            if mr <= needMex then
+                why = string.format('stored mass is %d%%, must be above %d%% to upgrade a T%d mass extractor', mr * 100, needMex * 100, K.TechOf(bpid))
+                return false
+            end
+            return true
+        end
         if EcoOnly(ctx) then why = 'economy-only phase' return false end
         local nextT = K.TechOf(bpid) + 1
         if ms.total == 0 then why = 'no mass extractors' return false end
@@ -371,6 +449,10 @@ function Handlers.upgrade(ctx, a)
             if not K.CatSet(bpid).MASSEXTRACTION and not u:IsIdleState() then IssueClearCommands({ u }) end
             IssueUpgrade({ u }, up)
             done = done + 1
+            if K.CatSet(bpid).MASSEXTRACTION then
+                ms.upgrading = ms.upgrading + 1
+                LastMexUpg = GetGameTimeSeconds()
+            end
         end
     end
     Say(ctx, string.format('upgrade %s: %d started%s', tostring(a.what or a.id), done,
@@ -380,12 +462,26 @@ end
 function Handlers.assist(ctx, a)
     local target = ctx.units[tostring(a.target)]
     if not target then return Say(ctx, 'assist: unknown target id ' .. tostring(a.target)) end
+    -- ASSIST RULE: engineers / ACU may only assist a mass extractor that is upgrading, or the ACU while it enhances.
+    local tcat = K.CatSet(target:GetUnitId())
+    local okMex = tcat.MASSEXTRACTION and tcat.STRUCTURE and target:IsUnitState('Upgrading')
+    local okAcu = tcat.COMMAND and target:IsUnitState('Enhancing')
+    if not (okMex or okAcu) then
+        return Say(ctx, 'assist refused: engineers/ACU only assist a mass extractor upgrade or an ACU upgrade')
+    end
     local tp = target:GetPosition()
     local n = Num(a.n, 2, 1, 20)
     local sent = {}
     for _, e in ipairs(Ranked(ctx, tp[1], tp[3], a.idle_only ~= false)) do
         if table.getn(sent) >= n then break end
-        table.insert(sent, e.unit)
+        if e.unit == target then e.acu = 'self' end
+        -- keep the commander near home: it only assists targets within ACUAssistRadius
+        local far = false
+        if e.acu then
+            local ap = e.unit:GetPosition()
+            far = Dist(ap[1], ap[3], tp[1], tp[3]) > (ctx.cfg.ACUAssistRadius or 200)
+        end
+        if not far and e.acu ~= 'self' then table.insert(sent, e.unit) end
     end
     if table.getn(sent) > 0 then IssueGuard(sent, target) end
     Say(ctx, string.format('assist %s: %d engineers sent', tostring(a.target), table.getn(sent)))

@@ -9,6 +9,7 @@ local Cfg     = import('/mods/LLMCommander/lua/LLMC/Config.lua').Config
 local State   = import('/mods/LLMCommander/lua/LLMC/State.lua')
 local Actions = import('/mods/LLMCommander/lua/LLMC/Actions.lua')
 local Macro   = import('/mods/LLMCommander/lua/LLMC/Macro.lua')
+local Micro   = import('/mods/LLMCommander/lua/LLMC/Micro.lua')
 
 local Started = false
 local TargetName = nil
@@ -57,6 +58,12 @@ function Main()
     end
     if not brain then LOG('LLMC|I|ERR army ' .. name .. ' does not exist') return end
 
+    -- MODE: 'micro'   = the built-in AI plays, the LLM micro-manages combat units (default)
+    --       'replace' = the built-in AI is switched off, the LLM + macro manager play
+    local micro = (Cfg.Takeover == 'micro')
+    local exec = Actions.Execute
+    if micro then exec = Micro.Execute end
+
     if Cfg.Takeover == 'replace' and not brain.LLMControlled then
         LOG('LLMC|I|WARN aibrain hook did not run for ' .. name .. '; the built-in AI is probably still active (overlay mode).')
     end
@@ -70,7 +77,7 @@ function Main()
     S.attack_size, S.land_factories, S.air_factories = Cfg.AttackSize, Cfg.LandFactories, Cfg.AirFactories
     local lastResults = {}
     LOG('LLMC|I|START|' .. sid)
-    LOG('LLMC|I|INFO controlling ' .. name .. ' (' .. tostring(brain.Nickname) .. ')')
+    LOG('LLMC|I|INFO controlling ' .. name .. ' (' .. tostring(brain.Nickname) .. ') mode=' .. tostring(Cfg.Takeover))
 
     while true do
         local now = GetGameTimeSeconds()
@@ -80,11 +87,12 @@ function Main()
         pcall(function() out = ArmyIsOutOfGame(brain:GetArmyIndex()) end)
         if out then LOG('LLMC|I|END') return end
 
+
         -- 1. collect the LLM's reply
         local box = ReadInbox()
         if box and box.sid == sid and type(box.seq) == 'number' and box.seq > lastExec and box.seq <= seq then
             lastExec = box.seq
-            local ok, results, count = pcall(Actions.Execute, brain, box.actions or {}, Cfg)
+            local ok, results, count = pcall(exec, brain, box.actions or {}, Cfg)
             if ok then
                 lastResults = results
             else
@@ -101,7 +109,14 @@ function Main()
         end
 
         -- 1b. automatic macro (eco, tech, production, waves) - independent of LLM latency
-        if now >= nextMacro then
+        if micro then
+            pcall(Micro.Maintain, brain, Cfg, now)
+            if Cfg.Rescue ~= false and now >= nextMacro then
+                nextMacro = now + Cfg.MacroInterval
+                local rok, rerr = pcall(Macro.Rescue, brain, Cfg, now)
+                if not rok then WARN('LLMC rescue error: ' .. tostring(rerr)) end
+            end
+        elseif now >= nextMacro then
             nextMacro = now + Cfg.MacroInterval
             local mok, merr = pcall(Macro.Tick, brain, Cfg, now)
             if not mok then WARN('LLMC macro error: ' .. tostring(merr)) end
@@ -110,20 +125,27 @@ function Main()
         -- 2. send a new observation
         if (not pending and now >= nextSend) or (pending and now - lastSent > Cfg.ResendAfter) then
             seq = seq + 1
-            local ok, st = pcall(State.Build, brain, Cfg, seq, sid, now, lastResults)
+            local ok, st = pcall(micro and Micro.BuildState or State.Build, brain, Cfg, seq, sid, now, lastResults)
             if ok then
-                st.strategy = Actions.Strategy
-                local nb = st.enemy_near_base
-                Actions.Emergency = (Cfg.EcoOnlyEmergency and nb and (nb.land + nb.air + nb.naval) >= 4) and true or false
-                if now < Cfg.EcoOnlySeconds and not Actions.Emergency then
-                    st.economy_only_until = Cfg.EcoOnlySeconds
+                if micro then
+                    st.rescue_active = Macro.IsRescue()
+                    st.macro_recent = Macro.Recent
+                    Macro.SetState(st)
+                else
+                    st.strategy = Actions.Strategy
+                    st.holding_mass_for_upgrades = Actions.HoldMass and true or false
+                    local nb = st.enemy_near_base
+                    Actions.Emergency = (Cfg.EcoOnlyEmergency and nb and (nb.land + nb.air + nb.naval) >= 4) and true or false
+                    if now < Cfg.EcoOnlySeconds and not Actions.Emergency then
+                        st.economy_only_until = Cfg.EcoOnlySeconds
+                    end
+                    st.macro_recent = Macro.Recent
+                    Macro.SetState(st)
                 end
-                st.macro_recent = Macro.Recent
-                Macro.SetState(st)
                 Json.LogChunks('S', seq, Json.Encode(st))
                 pending = true
                 lastSent = now
-                nextSend = now + Cfg.StateInterval
+                nextSend = now + (micro and (Cfg.MicroInterval or 8) or Cfg.StateInterval)
                 lastResults = {}
             else
                 WARN('LLMC state error: ' .. tostring(st))
