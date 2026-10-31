@@ -3,6 +3,7 @@ I wanted to have a mod like but i could not find one so i asked claude.ai to mak
 # Recommend Models
 Qwen3.8-9B-Distill-GGUF
 Download it here https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/blob/main/Qwen3.8-9B-Q8_0.gguf
+
 # LLM Commander (Supreme Commander: Forged Alliance + LOUD)
 
 A local LLM (llama.cpp `llama-server`, Ollama, LM Studio, anything OpenAI-compatible) plays one army.
@@ -18,12 +19,25 @@ Skirmish vs AI only. **Not multiplayer-safe** (the sim reads a local file, so ot
   ACU are never touched. Units taken are moved into a plan-less platoon (`MakePlatoon` + `AssignUnitsToPlatoon`) so LOUD's
   platoon logic stops re-tasking them, and are returned to LOUD's `ArmyPool` afterwards. The macro manager, economy-only
   opening, tech/mex rules etc. below are NOT used in this mode.
-  Actions: `order` (attack/move/patrol/retreat/stop on a selection by role + area + health), `focus`, `scout`, `release`.
+  Actions: `order` (attack/move/patrol/retreat/stop on a selection by role + area + health), `focus`, `scout`, `release`, plus the gateway-ACU actions below.
   Observation every `MicroInterval` (8 s): your unit groups (position, size, composition, health, nearest enemy,
   engaged?), visible enemy clusters, threats at your base. "Do nothing" is a valid answer.
 - **`replace`:** the AI slot's built-in AI is switched off and the LLM + macro manager play it (everything below).
 - **`overlay`:** like `replace` but the built-in AI is left running.
 In `micro` mode the LLM's army is the highest-numbered AI slot (or `Config.Army`): add a LOUD AI player in the lobby as usual.
+**Quantum Gateway ACUs (micro mode):** every support ACU (SACU) the Quantum Gateway builds is claimed permanently
+for the LLM (never handed back to LOUD). Their jobs, in priority order:
+1. *Base defences lacking* (no shield, fewer than 6 AA or fewer than 8 PD + artillery within `DefenseRadius` of your start)
+   -> `defense_cluster`: a **Tech 3 shield**, then **10 SAMs** (T3 AA) under it, then a mix of **T2 artillery and T2 point
+   defence**, alternating, as many as fit inside the shield bubble (spots are packed from the shield outwards).
+2. *Mass not being used* (stored mass >= `StallMassRatio`) -> `experimental`: a **Tech 4 unit** built in the field
+   (one at a time).
+3. *Mass short* (< 50% stored, energy >= 60%) -> `mass_farm`: a **T3 power plant ringed by T2 mass fabricators** (up to 16;
+   the plant is queued first so the fabricators get the adjacency bonus; the ring has however many tiles the plant's
+   footprint allows). Limits: `MaxDefenseClusters` (2), `MaxMassFarms` (3).
+The LLM can order all of these itself (`defense_cluster`, `experimental`, `mass_farm`, `sacu`); with `GatewayAuto = true`
+the mod also applies the same rules automatically whenever a gateway ACU is idle (`GatewayAuto = false` leaves it to the LLM).
+
 **Rescue:** if LOUD stops building - engineers or factories idle - while stored mass is >= 70% or energy >= 95% for 20 s
 (`StallSeconds`, `StallMassRatio`, `StallEnergyRatio`), the macro manager temporarily spends the resources for it (mex, power,
 mass fabricators when energy floats, factories, mex upgrades, units, AA/PD if attacked) and switches off again once
@@ -73,16 +87,9 @@ economy: mex, power, engineers (plus the very first land factory and mex upgrade
 defences, factory tech-ups or attacks - enforced for both the macro and LLM orders. If 4+ enemy units reach your base
 (`EcoOnlyEmergency`) the restriction is lifted until they leave. Set `EcoOnlySeconds = 0` to disable.
 
-**Mass rules:** the 2 opening engineers build the first 4 mex; after that mass comes from more mex and from upgrades.
-Mex upgrades (T1->T2 and T2->T3) happen **one at a time**, and only when stored mass is **above 50%** of capacity
-(`MexUpgradeMassRatio`) - enforced in the upgrade order, so LLM orders obey it. While an upgrade is waiting for mass the
-macro (`PauseArmyForMexUpgrade`) holds back mass: no engineers (capped at 4 + 1 per 4 mex, max 8), extra factories, radar or
-units while a mex upgrade is pending/running or a factory upgrade is about to start - factories idle on purpose - unless your base is
-under attack. Power and mass buildings and the upgrades are never held, and ALL idle engineers plus the idle ACU (if within `ACUAssistRadius`) assist an upgrading mex or an ACU upgrade - and nothing else
-(assist orders on anything else are refused, for the LLM too); otherwise they reclaim.
-
-**Early power limit:** in the first 5 minutes (`PowerRatioSeconds`) at most 1 power generator per 2 mass extractors
-(`MexPerPgen`; minimum 2, the opening's first two are exempt) - enforced for the macro and LLM orders.
+**Assisting:** ALL idle engineers plus the idle ACU (if within `ACUAssistRadius`) assist an upgrading mex or an ACU
+upgrade - and nothing else (assist orders on anything else are refused, for the LLM too); otherwise they reclaim.
+The 2 opening engineers build the first 4 mex.
 
 **Engineers:** no new engineers are queued while any engineer is idle (macro and LLM orders alike).
 
@@ -104,4 +111,3 @@ storage are always allowed. Applies to the macro and to LLM orders; the very fir
 ## Config (`lua/LLMC/Config.lua`)
 `Army` (auto or a number), `Takeover` (`replace` | `overlay`), `StateInterval`, `MaxActionsPerTurn`, `UseACUToBuild`, `RevealEnemyStarts`.
 Bridge flags: `--temperature`, `--max-tokens` (default 2500), `--no-json-mode`, `--extra-system file.txt` (e.g. `/no_think` for Qwen3), `-v`.
-
