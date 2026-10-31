@@ -1,3 +1,6 @@
+# Note i am Not a programmer
+I wanted to have a mod like but i could not find one so i asked claude.ai to make one. I can't fix bugs with out claude ai or make improvements.
+
 # LLM Commander (Supreme Commander: Forged Alliance + LOUD)
 
 A local LLM (llama.cpp `llama-server`, Ollama, LM Studio, anything OpenAI-compatible) plays one army.
