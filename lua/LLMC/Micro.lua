@@ -1,9 +1,8 @@
--- LLM Commander :: MICRO mode.
--- The built-in (LOUD) AI keeps playing the whole game: economy, tech, base, production, its own attack plans.
--- The LLM only micro-manages COMBAT UNITS: it can take a selection of units away from the AI for a short time,
--- give them tactical orders (retreat damaged units, concentrate, focus fire, raid, scout) and the units are handed
--- back to the AI automatically after Config.MicroHoldSeconds without a new order (or on an explicit "release").
--- Engineers, structures and the ACU are never touched.
+-- LLM Commander :: MICRO / ARMY modes.
+-- micro: the LOUD AI plays everything and keeps ALL its units; the LLM controls ONLY the Quantum Gateway ACUs (SACUs).
+-- army : additionally the LLM owns every attack unit for good. The unit micro below (order/focus/scout/release/rally) is army-mode only.
+-- Unit control (army mode): the LLM claims every combat unit for good and gives tactical orders. Engineers, structures and
+-- the original ACU are never touched.
 -- Lua 5.0 style: no '#', no '%'.
 
 local K = import('/mods/LLMCommander/lua/LLMC/Kinds.lua')
@@ -99,6 +98,58 @@ local function ClaimSacus(brain, now)
     end
 end
 
+-- ARMY MODE: the LLM owns ALL attack units permanently. New ones are claimed as soon as they appear.
+local LastClaimAll = -100
+local function ClaimAllCombat(brain, now)
+    if now - LastClaimAll < 3 then return end
+    LastClaimAll = now
+    local fresh = {}
+    for _, u in ipairs(K.Select(brain:GetListOfUnits(categories.ALLUNITS, false, true), K.Squads.all)) do
+        if not Held[tostring(u:GetEntityId())] and K.MobileRole(u:GetUnitId()) ~= 'other' then table.insert(fresh, u) end
+    end
+    if table.getn(fresh) > 0 then Take(brain, fresh, now, true) end
+end
+
+-- Staging point: a spot in front of the base, towards the nearest enemy start. Idle attack units gather here.
+Staging = false          -- false (not nil): reading a never-assigned global is an error in the FA engine
+local function StagingPoint(brain, cfg)
+    if Staging then return Staging end
+    local bx, bz = brain:GetArmyStartPos()
+    local idx = brain:GetArmyIndex()
+    local bestX, bestZ, bd = nil, nil, 1e9
+    for i, b in ipairs(ArmyBrains) do
+        if i ~= idx and IsEnemy(idx, i) then
+            local ok, x, z = pcall(function() return b:GetArmyStartPos() end)
+            if ok and x then
+                local d = Dist(x, z, bx, bz)
+                if d < bd then bd, bestX, bestZ = d, x, z end
+            end
+        end
+    end
+    local dist = cfg.StagingDistance or 70
+    if bestX and bd > 1 then
+        Staging = { bx + (bestX - bx) / bd * dist, bz + (bestZ - bz) / bd * dist }
+    else
+        Staging = { bx + 30, bz + 30 }
+    end
+    return Staging
+end
+
+-- Units the LLM has not used for IdleFallbackSeconds go to the staging point (instead of standing at the factory).
+local function IdleFallback(brain, cfg, now)
+    local st = StagingPoint(brain, cfg)
+    local list = {}
+    for _, h in pairs(Held) do
+        local u = h.unit
+        if (not u.Dead) and h.perm and u:IsIdleState() and now - h.t > (cfg.IdleFallbackSeconds or 25)
+           and K.MobileRole(u:GetUnitId()) ~= 'scouts' and K.CatSet(u:GetUnitId()).MOBILE and not K.CatSet(u:GetUnitId()).SUBCOMMANDER then
+            local p = u:GetPosition()
+            if Dist(p[1], p[3], st[1], st[2]) > 30 then table.insert(list, u) end
+        end
+    end
+    if table.getn(list) > 0 then IssueAggressiveMove(list, Vec(st[1], st[2])) end
+end
+
 -- live, finished gateway ACUs owned by the LLM
 local function SacuList()
     local out = {}
@@ -111,6 +162,10 @@ end
 -- Called every second by the controller: expire old holds, forget dead units.
 function Maintain(brain, cfg, now)
     ClaimSacus(brain, now)
+    if cfg.Takeover == 'army' then
+        ClaimAllCombat(brain, now)
+        IdleFallback(brain, cfg, now)
+    end
     local expired = {}
     for id, h in pairs(Held) do
         if h.unit.Dead then
@@ -141,7 +196,7 @@ function BuildState(brain, cfg, seq, sid, now, lastResults)
     local idx = brain:GetArmyIndex()
     local faction = brain:GetFactionIndex()
     local bx, bz = brain:GetArmyStartPos()
-    local st = { mode = 'micro', seq = seq, sid = sid, t = R(now), faction = K.FactionNames[faction], base = { R(bx), R(bz) } }
+    local st = { mode = cfg.Takeover, seq = seq, sid = sid, t = R(now), faction = K.FactionNames[faction], base = { R(bx), R(bz) } }
     if ScenarioInfo.size then st.map = { w = ScenarioInfo.size[1], h = ScenarioInfo.size[2] } end
     local mr, er = 0, 0
     pcall(function() mr = brain:GetEconomyStoredRatio('MASS') er = brain:GetEconomyStoredRatio('ENERGY') end)
@@ -223,8 +278,15 @@ function BuildState(brain, cfg, seq, sid, now, lastResults)
         table.insert(out, { pos = { R(gx), R(gz) }, n = g.n, roles = g.roles, hp = R1(g.hp / g.n),
             idle = g.idle, held_by_llm = g.held, nearest_enemy = ne, engaged = (ne ~= nil and ne.dist < 70) })
     end
-    st.groups = out
-    st.units_held_by_llm = HeldCount()
+    if cfg.Takeover == 'army' then
+        st.groups = out
+        st.units_held_by_llm = HeldCount()
+        local idleAll = 0
+        for _, g in ipairs(groups) do idleAll = idleAll + g.idle end
+        st.idle_attack_units = idleAll
+        local sp = StagingPoint(brain, cfg)
+        st.rally = { R(sp[1]), R(sp[2]) }
+    end
     st.enemy = e.clusters
     st.enemy_near_base = e.near_base
     st.under_attack = (e.near_base.land + e.near_base.air + e.near_base.naval) > 0
@@ -239,12 +301,16 @@ function BuildState(brain, cfg, seq, sid, now, lastResults)
     end
     st.gateway = { built = gateways > 0, sacus = table.getn(sacuList), idle = sacuIdle, ids = sacuIds }
     local shields, aas, pds, artys = defs.shield or 0, defs.aa or 0, defs.pd or 0, defs.arty or 0
-    st.defense_status = { shields = shields, aa = aas, pd = pds, artillery = artys, radius = cfg.DefenseRadius or 90,
-        lacking = (shields == 0 or aas < 6 or (pds + artys) < 8) }
+    -- base-defence building is only a concern when there are gateway ACUs to build it (micro and army mode)
+    if table.getn(sacuList) > 0 then
+        st.defense_status = { shields = shields, aa = aas, pd = pds, artillery = artys, radius = cfg.DefenseRadius or 90,
+            lacking = (shields == 0 or aas < 6 or (pds + artys) < 8) }
+        st.defense_clusters = Gateway.Clusters
+    end
     st.experimentals = exps
     st.mass_farms = Gateway.Farms
-    st.defense_clusters = Gateway.Clusters
     st.auto_recent = AutoRecent
+    st.t4_under_construction = T4Building
 
     if acu then
         st.acu = { pos = { R(acu:GetPosition()[1]), R(acu:GetPosition()[3]) }, hp = R1(HpOf(acu)) }
@@ -260,6 +326,12 @@ function BuildState(brain, cfg, seq, sid, now, lastResults)
         st.enemy_starts = starts
     end
     st.last_results = lastResults
+    if cfg.Takeover == 'sacu' then
+        -- sacu mode: the LLM only sees what matters for the gateway ACUs (no unit groups)
+        st.groups = nil
+        st.units_held_by_llm = nil
+        st.radar_blips = nil
+    end
     return st
 end
 
@@ -398,6 +470,9 @@ end
 
 -- {"a":"release", role, near, radius, ...}: give the selected units back to the built-in AI right now
 function Handlers.release(ctx, a)
+    if ctx.cfg.Takeover == 'army' then
+        return Say(ctx, 'release: not available in army mode - you own all attack units; give them orders instead')
+    end
     local units, err = Select(ctx, a)
     if not units then return Say(ctx, 'release: ' .. err) end
     local mine = {}
@@ -406,6 +481,27 @@ function Handlers.release(ctx, a)
     end
     Release(ctx.brain, mine)
     Say(ctx, string.format('release: %d units handed back to the AI', table.getn(mine)))
+end
+
+-- {"a":"rally","x":X,"z":Z}  (army mode) change the staging point where idle attack units gather
+function Handlers.rally(ctx, a)
+    if ctx.cfg.Takeover ~= 'army' then return Say(ctx, 'rally: only in army mode') end
+    local x, z = tonumber(a.x), tonumber(a.z)
+    if not x or not z then return Say(ctx, 'rally: need x and z') end
+    Staging = { x, z }
+    Say(ctx, string.format('rally: staging point set to %d,%d', x, z))
+end
+
+-- {"a":"assist_t4"}: idle gateway ACUs assist the nearest Tech 4 unit/building under construction ("force":true = all of them)
+function Handlers.assist_t4(ctx, a)
+    local list = {}
+    for _, u in ipairs(ctx.sacus) do
+        if a.force or u:IsIdleState() then table.insert(list, u) end
+    end
+    if table.getn(list) == 0 then return Say(ctx, 'assist_t4: no idle gateway ACUs') end
+    local what = AssistT4(ctx.brain, list)
+    if what then Say(ctx, string.format('assist_t4: %d gateway ACUs help build %s', table.getn(list), what))
+    else Say(ctx, 'assist_t4: no Tech 4 unit or building is under construction') end
 end
 
 -- Gateway ACU actions
@@ -431,6 +527,9 @@ function Handlers.sacu(ctx, a)
     Say(ctx, string.format('sacu %s: %d gateway ACUs', cmd, table.getn(ctx.sacus)))
 end
 
+-- micro mode controls ONLY the gateway ACUs: orders that command LOUD's combat units are refused
+local UnitOnly = { order = true, focus = true, scout = true, release = true, rally = true }
+
 function Execute(brain, actions, cfg)
     local bx, bz = brain:GetArmyStartPos()
     local ctx = { brain = brain, cfg = cfg, results = {}, now = GetGameTimeSeconds(), idx = brain:GetArmyIndex(),
@@ -444,8 +543,10 @@ function Execute(brain, actions, cfg)
             Say(ctx, 'action ' .. count .. ': malformed')
         else
             local h = Handlers[a.a]
-            if not h then
-                Say(ctx, 'unknown action "' .. a.a .. '" (micro mode: order, focus, scout, release, sacu, defense_cluster, mass_farm, experimental)')
+            if h and (cfg.Takeover == 'micro' or cfg.Takeover == 'sacu') and UnitOnly[a.a] then
+                Say(ctx, a.a .. ' refused: in ' .. tostring(cfg.Takeover) .. ' mode you control ONLY the gateway ACUs (sacu, defense_cluster, mass_farm, experimental, assist_t4); the AI commands all other units')
+            elseif not h then
+                Say(ctx, 'unknown action "' .. a.a .. '"')
             else
                 local ok, err = pcall(h, ctx, a)
                 if not ok then Say(ctx, a.a .. ' failed: ' .. tostring(err)) end
@@ -471,13 +572,58 @@ local function ANote(now, msg)
     while table.getn(AutoRecent) > 6 do table.remove(AutoRecent, 1) end
 end
 
+T4Building = false     -- true while any of our Tech 4 (experimental) units/buildings is under construction
+
+-- Gateway ACUs in `sacus` assist the nearest Tech 4 unit or building under construction (ours or LOUD's).
+-- Structures are guarded directly; for a unit being built in a factory/by an engineer the builder is guarded.
+-- Returns the blueprint id helped, or nil.
+function AssistT4(brain, sacus)
+    if table.getn(sacus) == 0 then return nil end
+    local all = brain:GetListOfUnits(categories.ALLUNITS, false)
+    local focusOf = {}
+    for _, u in ipairs(all) do
+        if not u.Dead then
+            local s = K.CatSet(u:GetUnitId())
+            if s.ENGINEER or s.FACTORY then
+                local ok, f = pcall(function() return u:GetFocusUnit() end)
+                if ok and f and not f.Dead then focusOf[tostring(f:GetEntityId())] = u end
+            end
+        end
+    end
+    local cx, cz = 0, 0
+    for _, u in ipairs(sacus) do
+        local p = u:GetPosition()
+        cx = cx + p[1] cz = cz + p[3]
+    end
+    cx = cx / table.getn(sacus) cz = cz / table.getn(sacus)
+
+    local best, bestD, bestId = nil, 1e9, nil
+    for _, u in ipairs(all) do
+        if not u.Dead and u:GetFractionComplete() < 1 then
+            local bpid = u:GetUnitId()
+            local s = K.CatSet(bpid)
+            if s.EXPERIMENTAL then
+                local target = u
+                if not s.STRUCTURE then target = focusOf[tostring(u:GetEntityId())] or u end
+                local p = target:GetPosition()
+                local d = Dist(p[1], p[3], cx, cz)
+                local mine = false
+                for _, sc in ipairs(sacus) do if sc == target then mine = true end end
+                if (not mine) and d < bestD then best, bestD, bestId = target, d, bpid end
+            end
+        end
+    end
+    if not best then return nil end
+    IssueGuard(sacus, best)
+    return bestId
+end
+
 function Auto(brain, cfg, now)
     if cfg.GatewayAuto == false or now < AutoCool then return end
     local sacus = SacuList()
     if table.getn(sacus) == 0 then return end
-    local idle = 0
-    for _, u in ipairs(sacus) do if u:IsIdleState() then idle = idle + 1 end end
-    if idle == 0 then return end
+    local idleList = {}
+    for _, u in ipairs(sacus) do if u:IsIdleState() then table.insert(idleList, u) end end
 
     local mr, er = 0, 0
     pcall(function() mr = brain:GetEconomyStoredRatio('MASS') er = brain:GetEconomyStoredRatio('ENERGY') end)
@@ -487,26 +633,38 @@ function Auto(brain, cfg, now)
         if not u.Dead then
             local bpid = u:GetUnitId()
             local s = K.CatSet(bpid)
+            if s.EXPERIMENTAL and u:GetFractionComplete() < 1 then expBuilding = true end
             if s.STRUCTURE then
                 local k = K.StructureKind(bpid)
                 if k == 'shield' or k == 'aa' or k == 'pd' or k == 'arty' then
                     local p = u:GetPosition()
                     if Dist(p[1], p[3], bx, bz) <= (cfg.DefenseRadius or 90) then defs[k] = (defs[k] or 0) + 1 end
                 end
-            elseif s.EXPERIMENTAL and s.MOBILE and u:GetFractionComplete() < 1 then
-                expBuilding = true
             end
         end
     end
+    T4Building = expBuilding
+    if table.getn(idleList) == 0 then return end
     local lacking = (defs.shield or 0) == 0 or (defs.aa or 0) < 6 or ((defs.pd or 0) + (defs.arty or 0)) < 8
 
     local act, why = nil, nil
     if lacking and now >= DefBlock and Gateway.Clusters < (cfg.MaxDefenseClusters or 2) then
         act, why = { a = 'defense_cluster', near = { bx, bz } }, 'base defences lacking'
-    elseif mr >= (cfg.StallMassRatio or 0.7) and not expBuilding then
-        act, why = { a = 'experimental', what = 'any', near = { bx, bz } }, 'mass not being used'
-    elseif mr < 0.5 and er >= 0.6 and now >= FarmBlock and Gateway.Farms < (cfg.MaxMassFarms or 3) then
-        act, why = { a = 'mass_farm', near = { bx, bz } }, 'need more mass'
+    elseif expBuilding and cfg.AssistT4 ~= false then
+        -- a Tech 4 unit/building is being built (by us or by LOUD): idle gateway ACUs help finish it
+        local what = AssistT4(brain, idleList)
+        if what then
+            AutoCool = now + 6
+            ANote(now, 'assisting construction of ' .. what .. ' with ' .. table.getn(idleList) .. ' gateway ACU(s)')
+            return
+        end
+    end
+    if not act then
+        if mr >= (cfg.StallMassRatio or 0.7) and not expBuilding then
+            act, why = { a = 'experimental', what = 'any', near = { bx, bz } }, 'mass not being used'
+        elseif mr < 0.5 and er >= 0.6 and now >= FarmBlock and Gateway.Farms < (cfg.MaxMassFarms or 3) then
+            act, why = { a = 'mass_farm', near = { bx, bz } }, 'need more mass'
+        end
     end
     if not act then return end
 

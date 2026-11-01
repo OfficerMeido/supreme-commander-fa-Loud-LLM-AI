@@ -60,7 +60,7 @@ function Main()
 
     -- MODE: 'micro'   = the built-in AI plays, the LLM micro-manages combat units (default)
     --       'replace' = the built-in AI is switched off, the LLM + macro manager play
-    local micro = (Cfg.Takeover == 'micro')
+    local micro = (Cfg.Takeover == 'micro' or Cfg.Takeover == 'army' or Cfg.Takeover == 'sacu')
     local exec = Actions.Execute
     if micro then exec = Micro.Execute end
 
@@ -113,7 +113,7 @@ function Main()
             pcall(Micro.Maintain, brain, Cfg, now)
             if now >= nextMacro then
                 nextMacro = now + Cfg.MacroInterval
-                if Cfg.Rescue ~= false then
+                if Cfg.Rescue ~= false and Cfg.Takeover ~= 'sacu' then      -- sacu mode: nothing but the gateway ACUs is touched
                     local rok, rerr = pcall(Macro.Rescue, brain, Cfg, now)
                     if not rok then WARN('LLMC rescue error: ' .. tostring(rerr)) end
                 end

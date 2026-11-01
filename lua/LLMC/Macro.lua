@@ -289,7 +289,8 @@ function Tick(brain, cfg, now, rescue)
 
     -- 6. react to attacks with static defence
     local st = LastState
-    if st and st.enemy_near_base and idleLeft > 0 and not ecoOnly and Ready('defense', now) then
+    if st and st.enemy_near_base and idleLeft > 0 and not ecoOnly and Ready('defense', now)
+       and not rescue then      -- micro/army mode: static defences only come from gateway ACUs
         local nb = st.enemy_near_base
         if nb.air >= 3 and c.aa < math.min(8, 2 + math.floor(nb.air / 3)) then
             Add({ a = 'build', what = 'aa', n = 1, tech = S.tech, near = base, radius = 40, idle_only = true })

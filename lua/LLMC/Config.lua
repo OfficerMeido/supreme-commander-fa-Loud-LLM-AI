@@ -6,17 +6,26 @@ Config = {
     --   number : that army number, e.g. 2  ->  ARMY_2
     Army = 'auto',
 
-    -- 'micro'   : (default) the built-in LOUD AI plays the whole game - economy, tech, base, production, its own
-    --             attack plans. The LLM only MICRO-MANAGES combat units: it takes selected units from the AI for
-    --             a short time, gives tactical orders, and they go back to the AI automatically.
+    -- 'micro'   : (default) the built-in LOUD AI plays the whole game - economy, tech, base, production, ALL of its
+    --             units and its attack plans. The LLM controls ONLY the Quantum Gateway ACUs (SACUs): defence
+    --             clusters, Tech 4 units, mass farms, assisting Tech 4 construction.
+    -- 'sacu'    : the LLM controls ONLY the Quantum Gateway ACUs, and the mod touches nothing else: like 'micro' but WITHOUT
+    --             the rescue watchdog (LOUD's engineers/factories are never given orders) and with a slimmer observation.
+    -- 'army'    : like 'micro', and in addition the LLM owns ALL attack units for good (land, air, naval, scouts, experimentals):
+    --             every combat unit is claimed the moment it is built and never returned. LOUD keeps the economy,
+    --             tech, base and unit production; the LLM fights the war. Units idle for IdleFallbackSeconds
+    --             gather at a staging point in front of the base.
     -- 'replace' : the chosen AI slot's built-in (LOUD) AI is switched off; the LLM + the macro manager play.
     -- 'overlay' : like 'replace' but the built-in AI is left running (they will fight over units).
     Takeover = 'micro',
 
-    -- micro mode: game seconds between observations, and how long units stay under LLM control without a new order
-    -- before they are handed back to the AI.
+    -- micro/army modes: game seconds between observations. MicroHoldSeconds is only used for units taken by an order
+    -- (army mode claims units permanently), before they would be handed back to the AI.
     MicroInterval = 8,
     MicroHoldSeconds = 40,
+    -- army mode
+    IdleFallbackSeconds = 25,
+    StagingDistance = 70,     -- how far in front of the base (towards the nearest enemy) the staging point is
 
     -- Game seconds between observations sent to the LLM.
     StateInterval = 15,
@@ -38,6 +47,7 @@ Config = {
     -- mass is not being used, and mass farms (T3 power plant ringed by 16 T2 fabricators). GatewayAuto applies those
     -- rules automatically whenever a gateway ACU is idle (the LLM can still order them itself).
     GatewayAuto = true,
+    AssistT4 = true,       -- idle gateway ACUs assist ANY Tech 4 unit/building under construction (ours or LOUD's)
     MaxDefenseClusters = 2,
     MaxMassFarms = 3,
     DefenseRadius = 90,    -- structures within this distance of your start position count as "base defences"
