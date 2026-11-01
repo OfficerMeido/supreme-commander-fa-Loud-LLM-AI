@@ -30,7 +30,40 @@ ALLOWED_ACTIONS = {
     "attack", "move", "patrol", "retreat", "stop", "scout", "rally", "strategy",
 }
 
-MICRO_ACTIONS = {"order", "focus", "scout", "release", "sacu", "defense_cluster", "mass_farm", "experimental"}
+MICRO_ACTIONS = {"order", "focus", "scout", "release", "sacu", "defense_cluster", "mass_farm", "experimental", "assist_t4", "rally"}
+
+GATEWAY_ACTIONS = {"sacu", "defense_cluster", "mass_farm", "experimental", "assist_t4"}
+
+GATEWAY_PROMPT = """You are LLM Gateway, the commander of the Quantum Gateway ACUs (SACUs) of a Supreme Commander: Forged Alliance (LOUD mod) army.
+The built-in LOUD AI plays the whole game: economy, tech, base, unit production, all combat units and its attack plans. You do NOT control any of that and you cannot give orders to any normal unit.
+You control ONLY the support ACUs (SACUs) that the Quantum Gateway builds: each one is permanently yours the moment it appears (state.gateway: built, sacus, idle, ids). Every ~8 game seconds you get a JSON state and answer with orders for them.
+If state.gateway.sacus is 0 there is nothing to do: reply with an empty actions list.
+
+STATIC DEFENSES RULE: you only worry about base-defense BUILDINGS (shield, SAMs, artillery, point defense) when you own gateway ACUs (only then does state.defense_status exist). With none, do not think about defenses at all.
+
+JOBS, in this priority:
+ a) BASE DEFENCES LACKING (state.defense_status.lacking = true: no shield, fewer than 6 AA or fewer than 8 PD+artillery near base): build defenses FIRST:
+    {"a":"defense_cluster","near":[x,z]} = a Tech 3 shield, then 10 SAMs under it, then a mix of T2 artillery and T2 point defense, as many as fit under the shield. Default position: base.
+ b) TECH 4 UNDER CONSTRUCTION (state.t4_under_construction = true: an experimental unit or building built by you or by the AI): idle SACUs ASSIST it so it finishes sooner: {"a":"assist_t4"} (add "force":true to pull all SACUs in).
+ c) MASS IS NOT BEING USED (state.eco.mass high, e.g. >= 0.7, or state.rescue_active) and no Tech 4 is being built: build a Tech 4 unit: {"a":"experimental","what":"land"|"air"|"any","near":[x,z],"n":1}. Do not stack several at once.
+ d) Otherwise, when mass is short (< 0.5) and energy is fine: {"a":"mass_farm","near":[x,z]} = a Tech 3 power plant surrounded by 16 T2 mass fabricators (limited number; expensive).
+ e) Move or recall the SACUs: {"a":"sacu","cmd":"move"|"retreat"|"stop","x":X,"z":Z}. Keep them away from enemy clusters (state.enemy).
+The mod also runs rules a-d automatically whenever a SACU is idle (see state.auto_recent): do not duplicate what it just ordered. state.rescue_active means the AI stalled and the mod's macro manager is temporarily spending resources for it.
+If nothing needs doing, issue NO orders.
+
+OUTPUT FORMAT - reply with ONLY one JSON object, no prose outside it:
+{"thoughts": "<=15 words", "notes": "<=200 chars shown to you next turn", "actions": [ ... max 6 ... ]}
+No comments, no trailing commas."""
+
+ARMY_ADDENDUM = """
+
+ARMY MODE - THIS OVERRIDES THE "micro" ADVICE ABOVE.
+You command ALL attack units of this army permanently: every land, air, naval and scout unit is yours the moment it is built, and you can NOT give them back (no "release"). The AI keeps running the economy, base and unit production, but it no longer commands the army - YOU fight the war.
+- Idle units are wasted. Units you leave idle for ~25 s walk to the staging point (state.rally) on their own; change it with {"a":"rally","x":X,"z":Z}. state.idle_attack_units says how many are idle.
+- Every turn make sure every group has a job. Doing nothing is NOT a good answer here.
+- Plan like a general: (1) when state.under_attack send the army to destroy the attackers (that is fighting - not building defenses), (2) mass the army at the staging point, (3) attack in waves with the whole army at the closest enemy cluster/base from state.enemy / state.enemy_starts, only when your force is clearly bigger than state.enemy_clusters' composition and defenses, (4) pull hurt units back (hp_below), (5) use fighters to guard and cover, bombers/gunships to raid weak spots, scouts to find the enemy, (6) re-issue attack orders every turn as the front moves; orders last until finished.
+- Never trickle units into a fight one by one; merge groups first.
+"""
 
 MICRO_PROMPT = """You are LLM Micro, a tactical micro-manager for a Supreme Commander: Forged Alliance (LOUD mod) army.
 The built-in LOUD AI plays the whole game: economy, tech, base building, unit production and its own attack plans. You do NOT control any of that.
@@ -46,11 +79,13 @@ WHAT TO DO (priorities)
 2. Concentrate: merge small groups before attacking (move them to the same point), attack with the full group, do not trickle units in.
 3. Focus fire on what matters: {"a":"focus","near":<group pos>,"radius":60,"tx":X,"tz":Z,"prefer":"acu"|"defense"|"structure"|"mobile"|"air"|"land"}.
 4. Defend home when under_attack: send land/air groups to the threat.
+STATIC DEFENSES RULE: you only worry about base-defense BUILDINGS (shield, SAMs, artillery, point defense) when you own gateway ACUs (state.gateway.sacus >= 1; only then does state.defense_status exist and only then is defense_cluster possible). With no gateway ACUs do not think about building defenses at all: the AI looks after its own base, and your job is the units. Defending against attackers with your units (rule 4) is separate and always fine.
 5. QUANTUM GATEWAY ACUs: every ACU (SACU) the Quantum Gateway builds is permanently yours (state.gateway: built, sacus, idle, ids). Use them for these three jobs, in this priority:
    a) BASE DEFENCES LACKING (state.defense_status.lacking = true, i.e. no shield, fewer than 6 AA or fewer than 8 PD+artillery near base): build defenses FIRST:
       {"a":"defense_cluster","near":[x,z]} = a Tech 3 shield, then 10 SAMs under it, then a mix of T2 artillery and T2 point defense, as many as fit under the shield. Put it where your base needs cover (default: base).
    b) MASS IS NOT BEING USED (state.eco.mass high, e.g. >= 0.7, or state.rescue_active): build Tech 4 units: {"a":"experimental","what":"land"|"air"|"any","near":[x,z],"n":1}. Do not stack several experimentals at once.
    c) Otherwise, when mass is short: {"a":"mass_farm","near":[x,z]} = a Tech 3 power plant surrounded by 16 T2 mass fabricators (limited number of farms; expensive).
+   d) TECH 4 UNDER CONSTRUCTION (state.t4_under_construction = true: an experimental unit or building, built by you or by the AI): idle gateway ACUs ASSIST it so it finishes sooner: {"a":"assist_t4"} (the mod does this automatically; add "force":true to pull all gateway ACUs in).
    Move or recall them with {"a":"sacu","cmd":"move"|"retreat"|"stop","x":X,"z":Z}. The mod also runs these rules automatically when a gateway ACU is idle; check state.auto_recent and do not duplicate what it just ordered.
 6. Raid and scout: bombers/gunships against weakly defended enemy clusters; scouts to unexplored enemy start positions: {"a":"scout","x":X,"z":Z}.
 7. state.rescue_active=true means the AI had stalled (idle builders while mass/energy floated) and the mod's macro manager is temporarily spending resources for it (see state.macro_recent). You do not handle that - keep micro-managing units only.
@@ -63,7 +98,7 @@ ACTIONS (each object has key "a"; max 12 per turn)
  {"a":"focus","role":ROLE,"near":[x,z],"radius":55,"tx":X,"tz":Z,"prefer":"acu","hp_above":0.3}   selected units attack ONE visible enemy near (tx,tz)
  {"a":"scout","x":X,"z":Z}   or with "points"
  {"a":"release","role":ROLE,"near":[x,z],"radius":80}   give units back to the AI now
- {"a":"defense_cluster","near":[x,z]}   {"a":"mass_farm","near":[x,z]}   {"a":"experimental","what":"land|air|any","near":[x,z],"n":1}   {"a":"sacu","cmd":"move|retreat|stop","x":X,"z":Z}   (gateway ACUs only)
+ {"a":"defense_cluster","near":[x,z]}   {"a":"mass_farm","near":[x,z]}   {"a":"experimental","what":"land|air|any","near":[x,z],"n":1}   {"a":"sacu","cmd":"move|retreat|stop","x":X,"z":Z}   {"a":"assist_t4"}   (gateway ACUs only)
 
 Coordinates are world [x, z]. Read state.last_results: it tells you what your last orders did or why they failed.
 
@@ -116,7 +151,7 @@ RULES
 - Scout with a cheap scout unit early; attack only with a clearly strong force; retreat if state.under_attack and your army is weak.
 - Never output anything except the JSON object. Be concise: thoughts under 15 words, notes under 200 characters, at most 16 actions, no comments, no trailing commas."""
 
-SAMPLE_MICRO_STATE = {
+SAMPLE_UNIT_STATE = {
     "mode": "micro", "seq": 1, "sid": 1, "t": 480, "faction": "UEF", "base": [100, 100], "map": {"w": 512, "h": 512},
     "eco": {"mass": 0.4, "energy": 0.8},
     "groups": [
@@ -130,6 +165,19 @@ SAMPLE_MICRO_STATE = {
     "enemy": [{"pos": [260, 260], "structures": 2, "defenses": 2, "land": 22, "air": 0, "naval": 0, "armies": [2], "dist": 230}],
     "enemy_near_base": {"land": 0, "air": 0, "naval": 0}, "under_attack": False,
     "acu": {"pos": [100, 100], "hp": 1.0}, "enemy_starts": [{"army": 2, "pos": [400, 400]}], "last_results": [],
+}
+
+SAMPLE_ARMY_STATE = dict(SAMPLE_UNIT_STATE, mode="army", rally=[140, 140], idle_attack_units=3)
+
+SAMPLE_MICRO_STATE = {
+    "mode": "micro", "seq": 1, "sid": 1, "t": 900, "faction": "UEF", "base": [100, 100], "map": {"w": 512, "h": 512},
+    "eco": {"mass": 0.75, "energy": 0.9},
+    "gateway": {"built": True, "sacus": 3, "idle": 2, "ids": ["101", "102", "103"]},
+    "defense_status": {"shields": 0, "aa": 2, "pd": 3, "artillery": 0, "radius": 90, "lacking": True},
+    "defense_clusters": 0, "mass_farms": 0, "experimentals": 0, "t4_under_construction": False, "rescue_active": False,
+    "enemy": [{"pos": [260, 260], "structures": 2, "defenses": 2, "land": 22, "air": 0, "naval": 0, "armies": [2], "dist": 230}],
+    "enemy_near_base": {"land": 0, "air": 0, "naval": 0}, "under_attack": False,
+    "acu": {"pos": [100, 100], "hp": 1.0}, "enemy_starts": [{"army": 2, "pos": [400, 400]}], "last_results": [], "auto_recent": [],
 }
 
 SAMPLE_STATE = {
@@ -434,7 +482,13 @@ class Bridge:
             "\nYOUR LAST ORDERS: " + json.dumps(self.prev_actions, separators=(",", ":"))[:1500] +
             "\n\nAnswer with the JSON object only."
         )
-        base_prompt = MICRO_PROMPT if state.get("mode") == "micro" else SYSTEM_PROMPT
+        mode = state.get("mode")
+        if mode == "army":
+            base_prompt = MICRO_PROMPT + ARMY_ADDENDUM
+        elif mode in ("micro", "sacu"):
+            base_prompt = GATEWAY_PROMPT
+        else:
+            base_prompt = SYSTEM_PROMPT
         sysmsg = base_prompt + (("\n\n" + self.extra) if self.extra else "")
         return [{"role": "system", "content": sysmsg}, {"role": "user", "content": user}]
 
@@ -478,9 +532,9 @@ class Bridge:
         if truncated:
             warnings.append("reply was cut off by the token limit; keep replies shorter")
             print("[bridge] reply hit max_tokens - consider raising --max-tokens")
-        micro = state.get("mode") == "micro"
+        micro = state.get("mode") in ("micro", "army", "sacu")
         acts = sanitize_actions(obj.get("actions", []), warnings, min(self.args.max_actions, 12) if micro else self.args.max_actions,
-                                MICRO_ACTIONS if micro else None)
+                                (MICRO_ACTIONS if state.get("mode") == "army" else GATEWAY_ACTIONS) if micro else None)
         notes = str(obj.get("notes", ""))[:400]
         return str(obj.get("thoughts", ""))[:300], notes, acts, warnings
 
@@ -535,7 +589,7 @@ def selftest(args):
     b = Bridge(args)
     print("Sending a sample state to", args.server, "...")
     t0 = time.time()
-    thoughts, notes, acts, warnings = b.decide(SAMPLE_MICRO_STATE if args.selftest_mode == "micro" else SAMPLE_STATE)
+    thoughts, notes, acts, warnings = b.decide((SAMPLE_ARMY_STATE if args.selftest_mode == "army" else dict(SAMPLE_MICRO_STATE, mode=args.selftest_mode)) if args.selftest_mode in ("micro", "sacu", "army") else SAMPLE_STATE)
     print(f"reply in {time.time() - t0:.1f}s\nthoughts: {thoughts}\nnotes: {notes}\nactions:")
     for x in acts:
         print("  ", json.dumps(x))
@@ -559,7 +613,7 @@ def main():
     p.add_argument("--no-json-mode", action="store_true", help="do not send response_format=json_object")
     p.add_argument("--extra-system", help="text file appended to the system prompt (e.g. '/no_think' or personality)")
     p.add_argument("--from-start", action="store_true", help="read the log from its beginning instead of its end")
-    p.add_argument("--selftest-mode", choices=["micro", "full"], default="micro", help="which game mode the --selftest sample state is for")
+    p.add_argument("--selftest-mode", choices=["micro", "sacu", "army", "full"], default="micro", help="which game mode the --selftest sample state is for")
     p.add_argument("--selftest", action="store_true", help="query the LLM once with a sample state and exit")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
