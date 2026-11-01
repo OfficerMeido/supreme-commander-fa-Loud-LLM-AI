@@ -3,6 +3,11 @@
 A local LLM (llama.cpp `llama-server`, Ollama, LM Studio, anything OpenAI-compatible) plays one army.
 Skirmish vs AI only. **Not multiplayer-safe** (the sim reads a local file, so other clients would desync).
 
+# LLM Commander (Supreme Commander: Forged Alliance + LOUD)
+
+A local LLM (llama.cpp `llama-server`, Ollama, LM Studio, anything OpenAI-compatible) plays one army.
+Skirmish vs AI only. **Not multiplayer-safe** (the sim reads a local file, so other clients would desync).
+
 **Status: written without access to a running game. Untested in-engine.** See "Assumptions" below.
 
 ## Modes (`Takeover` in `lua/LLMC/Config.lua`)
@@ -116,18 +121,3 @@ storage are always allowed. Applies to the macro and to LLM orders; the very fir
 ## Config (`lua/LLMC/Config.lua`)
 `Army` (auto or a number), `Takeover` (`replace` | `overlay`), `StateInterval`, `MaxActionsPerTurn`, `UseACUToBuild`, `RevealEnemyStarts`.
 Bridge flags: `--temperature`, `--max-tokens` (default 2500), `--no-json-mode`, `--extra-system file.txt` (e.g. `/no_think` for Qwen3), `-v`.
-
-## Fairness
-The LLM only sees enemy units you can see (omni/vision) or structures you have seen before; radar-only blips are
-counted but not identified. It is told enemy start positions (config `RevealEnemyStarts`).
-
-## Assumptions I could not verify (check these first if something fails)
-0. (micro mode) `MakePlatoon`, `PlatoonExists`, `AssignUnitsToPlatoon` and `GetPlatoonUniquelyNamed('ArmyPool')` exist as in stock FA AI brains and LOUD's platoon
-   logic leaves a plan-less platoon alone. If units keep being re-tasked by LOUD the log shows a WARN; the orders still go out.
-1. `hook/lua/aibrain.lua` (replace mode only) assumes LOUD still defines a global `AIBrain` class with `OnCreateAI`/`OnCreateHuman` in `/lua/aibrain.lua`.
-   If the log says the hook did not run, set `Takeover = 'overlay'` (LOUD's AI keeps running and fights the LLM for units).
-2. `hook/lua/SimInit.lua` assumes a global `BeginSession` in `/lua/SimInit.lua`.
-3. `doscript` re-reading `bridge/inbox.lua` while the game runs, and the engine flushing `LOG` lines promptly to the log file.
-   Symptom: bridge prints turns but the game never prints `executed orders`, or states arrive in bursts.
-4. Lua 5.0 API names (`GetListOfUnits`, `CanBuildStructureAt`, `IssueBuildMobile`, `IssueFactoryRallyPoint`, ...) follow stock FA; LOUD may differ.
-Failures are caught with `pcall` and reported in the log as `LLMC|I|...` / `WARN`, and fed back to the LLM in `last_results`.
