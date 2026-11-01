@@ -1,9 +1,3 @@
-# Note i am Not a programmer
-I wanted to have a mod like but i could not find one so i asked claude.ai to make one. I can't fix bugs with out claude ai or make improvements.
-# Recommend Models
-Qwen3.8-9B-Distill-GGUF
-Download it here https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/blob/main/Qwen3.8-9B-Q8_0.gguf
-
 # LLM Commander (Supreme Commander: Forged Alliance + LOUD)
 
 A local LLM (llama.cpp `llama-server`, Ollama, LM Studio, anything OpenAI-compatible) plays one army.
@@ -12,16 +6,22 @@ Skirmish vs AI only. **Not multiplayer-safe** (the sim reads a local file, so ot
 **Status: written without access to a running game. Untested in-engine.** See "Assumptions" below.
 
 ## Modes (`Takeover` in `lua/LLMC/Config.lua`)
-- **`micro` (default): the built-in LOUD AI plays, the LLM micro-manages.** LOUD keeps its economy, tech, base building,
-  production and attack plans. The LLM only controls *combat units*: it can take a selection of units from the AI for a
-  short time (`MicroHoldSeconds`, 40 game s), give tactical orders (retreat hurt units, concentrate groups, focus fire on
-  a target, raid, scout) and the units go back to the AI automatically (or on `release`). Engineers, structures and the
-  ACU are never touched. Units taken are moved into a plan-less platoon (`MakePlatoon` + `AssignUnitsToPlatoon`) so LOUD's
-  platoon logic stops re-tasking them, and are returned to LOUD's `ArmyPool` afterwards. The macro manager, economy-only
-  opening, tech/mex rules etc. below are NOT used in this mode.
-  Actions: `order` (attack/move/patrol/retreat/stop on a selection by role + area + health), `focus`, `scout`, `release`, plus the gateway-ACU actions below.
-  Observation every `MicroInterval` (8 s): your unit groups (position, size, composition, health, nearest enemy,
-  engaged?), visible enemy clusters, threats at your base. "Do nothing" is a valid answer.
+- **`micro` (default): LOUD plays everything; the LLM controls ONLY the Quantum Gateway ACUs (SACUs).** LOUD keeps its economy,
+  tech, base, production, *all* of its combat units and its attack plans - the LLM cannot give orders to any normal unit. Every
+  SACU the gateway builds is claimed permanently. Their jobs, in priority order: build base defences when they are lacking, assist
+  Tech 4 construction, build Tech 4 units when mass is floating, build mass farms when mass is short (details below). Actions:
+  `defense_cluster`, `experimental`, `mass_farm`, `assist_t4`, `sacu`. With no SACU the LLM has nothing to do and replies with no
+  orders. Unit orders (`order`, `focus`, `scout`, `release`, `rally`) are refused in this mode. The macro manager, economy-only
+  opening etc. further down are NOT used here (only the rescue watchdog is).
+- **`sacu`: the LLM controls ONLY the gateway ACUs - and the mod touches nothing else.** Same SACU jobs and orders as `micro`, but
+  without the rescue watchdog (LOUD's engineers and factories are never given orders, nothing spends resources for LOUD) and with a
+  slimmer observation (no unit groups). Set `Takeover = 'sacu'`; try it with `--selftest --selftest-mode sacu`. (`micro` is the same
+  SACU-only control plus the rescue watchdog.)
+- **`army`: the LLM owns ALL attack units.** Everything `micro` does (gateway-ACU jobs, rescue watchdog), plus: every combat unit - land, air, naval, scouts, experimentals - is claimed for good the
+  moment it is built and never handed back (no `release`). The LLM fights the whole war: defend, mass, attack in waves, retreat,
+  raid. Because replies take seconds, units left idle for `IdleFallbackSeconds` (25) gather at a staging point in front of
+  the base towards the nearest enemy (`StagingDistance`, change it with the `rally` action) instead of standing at the factory.
+  Set `Takeover = 'army'` in `Config.lua`; try it with `--selftest --selftest-mode army`.
 - **`replace`:** the AI slot's built-in AI is switched off and the LLM + macro manager play it (everything below).
 - **`overlay`:** like `replace` but the built-in AI is left running.
 In `micro` mode the LLM's army is the highest-numbered AI slot (or `Config.Army`): add a LOUD AI player in the lobby as usual.
@@ -35,8 +35,13 @@ for the LLM (never handed back to LOUD). Their jobs, in priority order:
 3. *Mass short* (< 50% stored, energy >= 60%) -> `mass_farm`: a **T3 power plant ringed by T2 mass fabricators** (up to 16;
    the plant is queued first so the fabricators get the adjacency bonus; the ring has however many tiles the plant's
    footprint allows). Limits: `MaxDefenseClusters` (2), `MaxMassFarms` (3).
-The LLM can order all of these itself (`defense_cluster`, `experimental`, `mass_farm`, `sacu`); with `GatewayAuto = true`
+4. *Any Tech 4 unit or building under construction* (an experimental built by you or by LOUD: experimental units, gantry-built
+   units, T4 structures) -> idle gateway ACUs **assist it** (`assist_t4`, `AssistT4 = true`): structures are guarded directly,
+   for a unit being built the factory/engineer building it is guarded. Defences-lacking still comes first.
+The LLM can order all of these itself (`defense_cluster`, `experimental`, `mass_farm`, `assist_t4`, `sacu`); with `GatewayAuto = true`
 the mod also applies the same rules automatically whenever a gateway ACU is idle (`GatewayAuto = false` leaves it to the LLM).
+In `micro` and `army` mode base-defence *buildings* are only a concern when gateway ACUs exist: without them the state has no `defense_status`,
+the prompt tells the LLM to ignore building defences, and the rescue watchdog builds no static defences. The army still fights attackers.
 
 **Rescue:** if LOUD stops building - engineers or factories idle - while stored mass is >= 70% or energy >= 95% for 20 s
 (`StallSeconds`, `StallMassRatio`, `StallEnergyRatio`), the macro manager temporarily spends the resources for it (mex, power,
@@ -111,3 +116,18 @@ storage are always allowed. Applies to the macro and to LLM orders; the very fir
 ## Config (`lua/LLMC/Config.lua`)
 `Army` (auto or a number), `Takeover` (`replace` | `overlay`), `StateInterval`, `MaxActionsPerTurn`, `UseACUToBuild`, `RevealEnemyStarts`.
 Bridge flags: `--temperature`, `--max-tokens` (default 2500), `--no-json-mode`, `--extra-system file.txt` (e.g. `/no_think` for Qwen3), `-v`.
+
+## Fairness
+The LLM only sees enemy units you can see (omni/vision) or structures you have seen before; radar-only blips are
+counted but not identified. It is told enemy start positions (config `RevealEnemyStarts`).
+
+## Assumptions I could not verify (check these first if something fails)
+0. (micro mode) `MakePlatoon`, `PlatoonExists`, `AssignUnitsToPlatoon` and `GetPlatoonUniquelyNamed('ArmyPool')` exist as in stock FA AI brains and LOUD's platoon
+   logic leaves a plan-less platoon alone. If units keep being re-tasked by LOUD the log shows a WARN; the orders still go out.
+1. `hook/lua/aibrain.lua` (replace mode only) assumes LOUD still defines a global `AIBrain` class with `OnCreateAI`/`OnCreateHuman` in `/lua/aibrain.lua`.
+   If the log says the hook did not run, set `Takeover = 'overlay'` (LOUD's AI keeps running and fights the LLM for units).
+2. `hook/lua/SimInit.lua` assumes a global `BeginSession` in `/lua/SimInit.lua`.
+3. `doscript` re-reading `bridge/inbox.lua` while the game runs, and the engine flushing `LOG` lines promptly to the log file.
+   Symptom: bridge prints turns but the game never prints `executed orders`, or states arrive in bursts.
+4. Lua 5.0 API names (`GetListOfUnits`, `CanBuildStructureAt`, `IssueBuildMobile`, `IssueFactoryRallyPoint`, ...) follow stock FA; LOUD may differ.
+Failures are caught with `pcall` and reported in the log as `LLMC|I|...` / `WARN`, and fed back to the LLM in `last_results`.
