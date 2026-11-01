@@ -1,3 +1,9 @@
+# Note i am Not a programmer
+I wanted to have a mod like but i could not find one so i asked claude.ai to make one. I can't fix bugs with out claude ai or make improvements.
+# Recommend Models
+Qwen3.8-9B-Distill-GGUF
+Download it here https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/blob/main/Qwen3.8-9B-Q8_0.gguf
+
 # LLM Commander (Supreme Commander: Forged Alliance + LOUD)
 
 A local LLM (llama.cpp `llama-server`, Ollama, LM Studio, anything OpenAI-compatible) plays one army.
