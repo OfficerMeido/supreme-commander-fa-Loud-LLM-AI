@@ -6,7 +6,8 @@ Download it here https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/blob/m
 
 # What i want to add
 
-add a Train mode in where your local LLM server will learn to play and improve via trail and error against a  LOUD AI 
+add a Train mode in where your local LLM server will learn to play and improve via trail and error against a  LOUD AI.
+
 LOUD AI is very good at playing the game so i am hoping it will learn to beat it
 
 # LLM Commander (Supreme Commander: Forged Alliance + LOUD)
