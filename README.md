@@ -9,7 +9,7 @@ Download it here https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/blob/m
 selecting what mode the LLM will run at start instead of editing lua/LLMC/Config.lua eg
 
 
-#Change Log
+# Change Log
 04/11/2026
 Added train mode testing
 
