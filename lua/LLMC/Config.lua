@@ -15,6 +15,10 @@ Config = {
     --             every combat unit is claimed the moment it is built and never returned. LOUD keeps the economy,
     --             tech, base and unit production; the LLM fights the war. Units idle for IdleFallbackSeconds
     --             gather at a staging point in front of the base.
+    -- 'train'   : TRAINING MODE. Like 'replace' (the slot's built-in AI is off, the LLM plays the whole game) but with no macro
+    --             manager and none of the rule gates (the LLM learns the build/tech order itself from the reward
+    --             function in Reward.lua). The episode ends when an army is destroyed; the bridge then reflects on the
+    --             episode, updates its lessons file and (optionally) restarts the match. See README "Train mode".
     -- 'replace' : the chosen AI slot's built-in (LOUD) AI is switched off; the LLM + the macro manager play.
     -- 'overlay' : like 'replace' but the built-in AI is left running (they will fight over units).
     Takeover = 'micro',
@@ -41,6 +45,22 @@ Config = {
 
     -- Tell the LLM where enemy start positions are (a human sees the spawn markers too).
     RevealEnemyStarts = true,
+
+    -- TRAIN mode
+    TrainEcoInterval = 10,       -- game seconds between economy-reward evaluations (storage / power / waste rewards)
+    TrainMaxSeconds = 10800,     -- an episode that lasts this long (3 hours) ends as a 'timeout'. Short games last 20-30 min, long ones 1-3 h
+    TrainEndOnAnyArmy = true,    -- true: the episode ends as soon as ANY army is destroyed; false: only when ALL enemies are
+    -- Terminal rewards - these make the agent train to WIN and destroy its opponents:
+    WinReward = 500,             -- the enemy army was destroyed
+    LossReward = -500,           -- your army was destroyed
+    TimeoutReward = -250,        -- neither side won within TrainMaxSeconds (stalling is discouraged)
+    TimePenaltyPerMinute = 5,    -- small cost per game minute: a faster win is better ...
+    TimePenaltyCap = 250,        -- ... but never more than this in total, so even a 3-hour win beats a loss
+    WinSpeedBonus = 300,         -- extra reward for winning EARLY (opponents get tougher the longer a game runs): full at 0 s,
+    WinSpeedHorizon = 7200,      -- falling linearly to 0 at this many seconds (20 min win ~ +250, 1 h ~ +150, 2 h+ = 0)
+    EcoRewardScale = 0.25,       -- the POSITIVE economy rewards (storage > 30%, power full, mass >= 80%) are multiplied by this ...
+    EcoRewardCap = 300,          -- ... and can add at most this much per 30 minutes of play (penalties keep their full value)
+    RewardMode = 'max',          -- kill reward: 'max' = highest applicable (3 / T4 6 / artillery 4 / nuke 8), 'sum' = add them
 
     -- micro mode QUANTUM GATEWAY: every ACU (SACU) the Quantum Gateway builds is taken from LOUD for good and belongs to
     -- the LLM, which uses them for: defence clusters (T3 shield + 10 SAMs + T2 artillery/PD under it), Tech 4 units when

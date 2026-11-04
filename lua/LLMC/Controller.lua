@@ -10,6 +10,7 @@ local State   = import('/mods/LLMCommander/lua/LLMC/State.lua')
 local Actions = import('/mods/LLMCommander/lua/LLMC/Actions.lua')
 local Macro   = import('/mods/LLMCommander/lua/LLMC/Macro.lua')
 local Micro   = import('/mods/LLMCommander/lua/LLMC/Micro.lua')
+local Reward  = import('/mods/LLMCommander/lua/LLMC/Reward.lua')
 
 local Started = false
 local TargetName = nil
@@ -33,7 +34,7 @@ end
 
 -- Called from the aibrain hook: should this brain's built-in AI be switched off?
 function ShouldTakeOver(brain)
-    if Cfg.Takeover ~= 'replace' then return false end
+    if Cfg.Takeover ~= 'replace' and Cfg.Takeover ~= 'train' then return false end
     return brain.Name == PickArmyName()
 end
 
@@ -61,10 +62,18 @@ function Main()
     -- MODE: 'micro'   = the built-in AI plays, the LLM micro-manages combat units (default)
     --       'replace' = the built-in AI is switched off, the LLM + macro manager play
     local micro = (Cfg.Takeover == 'micro' or Cfg.Takeover == 'army' or Cfg.Takeover == 'sacu')
+    --       'train'   = like 'replace' but NO macro manager and NO rule gates: the LLM plays the whole game and
+    --                   learns from the reward function (Reward.lua). The episode ends when an army is destroyed.
+    local train = (Cfg.Takeover == 'train')
+    local xcfg = Cfg
+    if train then
+        xcfg = setmetatable({ EcoOnlySeconds = 0, MinMassRatio = 0, MinEnergyRatio = 0, FreeRules = true, Macro = false },
+                            { __index = Cfg })
+    end
     local exec = Actions.Execute
     if micro then exec = Micro.Execute end
 
-    if Cfg.Takeover == 'replace' and not brain.LLMControlled then
+    if (Cfg.Takeover == 'replace' or train) and not brain.LLMControlled then
         LOG('LLMC|I|WARN aibrain hook did not run for ' .. name .. '; the built-in AI is probably still active (overlay mode).')
     end
 
@@ -74,6 +83,10 @@ function Main()
     local nextMacro = 0
     local S = Actions.Strategy
     S.macro, S.auto_attack, S.tech = Cfg.Macro, Cfg.AutoAttack, Cfg.TechTarget
+    if train then S.macro = false S.auto_attack = false end
+    local nextEco = 0
+    local idx = brain:GetArmyIndex()
+    if train then Reward.Reset(idx, Cfg) end
     S.attack_size, S.land_factories, S.air_factories = Cfg.AttackSize, Cfg.LandFactories, Cfg.AirFactories
     local lastResults = {}
     LOG('LLMC|I|START|' .. sid)
@@ -84,15 +97,55 @@ function Main()
 
         -- finished / dead?
         local out = false
-        pcall(function() out = ArmyIsOutOfGame(brain:GetArmyIndex()) end)
-        if out then LOG('LLMC|I|END') return end
+        pcall(function() out = ArmyIsOutOfGame(idx) end)
+        if train then
+            -- TERMINAL CONDITION: a training step (episode) ends when an army is destroyed
+            local result = nil
+            if out then
+                result = 'loss'
+            else
+                local anyOut, allOut, n = false, true, 0
+                for i, _ in ipairs(ArmyBrains) do
+                    local civ = false
+                    pcall(function() civ = ArmyIsCivilian(i) end)
+                    if i ~= idx and (not civ) and IsEnemy(idx, i) then
+                        n = n + 1
+                        local o = false
+                        pcall(function() o = ArmyIsOutOfGame(i) end)
+                        if o then anyOut = true else allOut = false end
+                    end
+                end
+                if n > 0 and ((Cfg.TrainEndOnAnyArmy and anyOut) or allOut) then result = 'win' end
+                if (not result) and now >= (Cfg.TrainMaxSeconds or 3600) then result = 'timeout' end
+            end
+            if result then
+                Reward.Terminal(result, now)
+                local last = Reward.PopStep()
+                local sum = Reward.Summary()
+                sum.result = result
+                sum.time = math.floor(now)
+                sum.last_step = last.step
+                Reward.Stop()
+                LOG('LLMC|I|EPISODE_END|' .. result .. '|' .. math.floor(sum.total) .. '|' .. math.floor(now))
+                LOG('LLMC|I|EPISODE HAS ENDED (' .. result .. ', reward ' .. math.floor(sum.total) .. ', ' .. math.floor(now) .. ' game seconds). The bridge is saving the playbook - START A NEW GAME to continue training.')
+                Json.LogChunks('E', seq + 1, Json.Encode(sum))
+                return
+            end
+            if now >= nextEco then
+                nextEco = now + (Cfg.TrainEcoInterval or 10)
+                pcall(Reward.EcoTick, brain, now)
+            end
+        elseif out then
+            LOG('LLMC|I|END')
+            return
+        end
 
 
         -- 1. collect the LLM's reply
         local box = ReadInbox()
         if box and box.sid == sid and type(box.seq) == 'number' and box.seq > lastExec and box.seq <= seq then
             lastExec = box.seq
-            local ok, results, count = pcall(exec, brain, box.actions or {}, Cfg)
+            local ok, results, count = pcall(exec, brain, box.actions or {}, xcfg)
             if ok then
                 lastResults = results
             else
@@ -120,7 +173,7 @@ function Main()
                 local aok, aerr = pcall(Micro.Auto, brain, Cfg, now)
                 if not aok then WARN('LLMC gateway auto error: ' .. tostring(aerr)) end
             end
-        elseif now >= nextMacro then
+        elseif (not train) and now >= nextMacro then
             nextMacro = now + Cfg.MacroInterval
             local mok, merr = pcall(Macro.Tick, brain, Cfg, now)
             if not mok then WARN('LLMC macro error: ' .. tostring(merr)) end
@@ -129,12 +182,15 @@ function Main()
         -- 2. send a new observation
         if (not pending and now >= nextSend) or (pending and now - lastSent > Cfg.ResendAfter) then
             seq = seq + 1
-            local ok, st = pcall(micro and Micro.BuildState or State.Build, brain, Cfg, seq, sid, now, lastResults)
+            local ok, st = pcall(micro and Micro.BuildState or State.Build, brain, xcfg, seq, sid, now, lastResults)
             if ok then
                 if micro then
                     st.rescue_active = Macro.IsRescue()
                     st.macro_recent = Macro.Recent
                     Macro.SetState(st)
+                elseif train then
+                    st.mode = 'train'
+                    st.reward = Reward.PopStep()
                 else
                     st.strategy = Actions.Strategy
                     local nb = st.enemy_near_base

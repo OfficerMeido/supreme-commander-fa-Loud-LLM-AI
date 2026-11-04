@@ -281,7 +281,7 @@ function Handlers.produce(ctx, a)
     if not isEng and EcoOnly(ctx) then
         return Say(ctx, 'produce ' .. kind .. ' skipped: economy-only phase (engineers only)')
     end
-    if isEng and not ctx.trusted then
+    if isEng and not ctx.trusted and not ctx.cfg.FreeRules then
         for _, e in ipairs(K.Select(ctx.all, K.Units.engineer)) do
             if e:IsIdleState() then
                 return Say(ctx, 'produce engineer skipped: an engineer is idle - give it work (or let it assist an upgrade) instead of building more')
@@ -359,6 +359,7 @@ function Handlers.upgrade(ctx, a)
     local needE = ctx.cfg.TechEnergyRatio or 0.98
     local why = nil
     local function GateOK(bpid)
+        if ctx.cfg.FreeRules then return true end      -- train mode: the agent learns the tech order from rewards
         if K.CatSet(bpid).MASSEXTRACTION then return true end
         if EcoOnly(ctx) then why = 'economy-only phase' return false end
         local nextT = K.TechOf(bpid) + 1
@@ -392,7 +393,7 @@ function Handlers.assist(ctx, a)
     local tcat = K.CatSet(target:GetUnitId())
     local okMex = tcat.MASSEXTRACTION and tcat.STRUCTURE and target:IsUnitState('Upgrading')
     local okAcu = tcat.COMMAND and target:IsUnitState('Enhancing')
-    if not (okMex or okAcu) then
+    if not (okMex or okAcu or ctx.cfg.FreeRules) then
         return Say(ctx, 'assist refused: engineers/ACU only assist a mass extractor upgrade or an ACU upgrade')
     end
     local tp = target:GetPosition()
