@@ -16,13 +16,17 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 
-BRIDGE_VERSION = 5
+BRIDGE_VERSION = 6
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from trainer import Trainer  # noqa: E402  (TRAIN mode bookkeeping)
+
 PREFIX = b"LLMC|"
 
 ALLOWED_ACTIONS = {
@@ -169,6 +173,34 @@ SAMPLE_UNIT_STATE = {
 
 SAMPLE_ARMY_STATE = dict(SAMPLE_UNIT_STATE, mode="army", rally=[140, 140], idle_attack_units=3)
 
+TRAIN_ACTIONS = ALLOWED_ACTIONS - {"strategy"}
+
+TRAIN_PROMPT = """You are LLM Commander in TRAINING MODE: you play ONE army of Supreme Commander: Forged Alliance (LOUD mod) against a LOUD AI or a human, and you get better by trial and error.
+There is NO macro manager and NO safety rules: you run everything yourself - economy, build order, tech, production, scouting, defence and attack. The built-in AI of your slot is switched off. Every ~15 game seconds you receive a JSON state and answer with orders; they run a few seconds later.
+
+REWARD - what you are trained to maximise (state.reward.step = reward earned since your last turn, state.reward.parts = which rewards, state.reward.episode_total = running total):
+ + KILLS: enemy unit or building destroyed +3; enemy Tech 4 +6; killed by your artillery installation +4; killed by your nuke +8 (the highest applicable one counts)
+ + PRODUCTION: every unit you finish +2; every Tech 4 unit +8
+ + ECONOMY (checked every 10 game seconds): mass AND power storage both above 30% +2; power storage full +3; mass storage at 80% or more +4 - but these positive economy rewards are multiplied by 0.25 and capped at 300 per 30 minutes of play, so they guide you without being the point
+ - PENALTIES: mass wasted (storage full and overflowing) -6; power storage under 20% -2; power at 0 -4; mass at 0 -4
+ - LOSSES: every unit lost -1; every building lost -3; every mass extractor lost -4
+ *** THE BIG ONE - THE GOAL IS TO WIN: destroying the enemy army (kill its commander and base) gives +500, PLUS a speed bonus of up to +300 for winning early (about +250 for a win after 20 minutes, +150 after 1 hour, nothing after 2 hours); having your own army destroyed gives -500; running out the clock (3 hours) without a winner gives -250; every game minute costs -5 (at most -250 in total). THE LONGER A GAME RUNS THE TOUGHER THE OPPONENT GETS (short games last 20-30 minutes, long games 1-3 hours): expand and tech fast, then attack - do not turtle and hope. state.reward.rules shows the current values. Economy points alone can never beat a win, so build a strong economy as a MEANS to build an army, find the enemy and destroy it. ***
+The episode (training step) ends when an army is destroyed - yours or the enemy's. Then the match restarts and you see lessons written from your past episodes. Maximise the TOTAL, which is dominated by winning: destroy the enemy commander and army as fast as you safely can; losing your own commander costs -500.
+
+ORDERS (each is an object with key "a"; at most 24 per turn; state.can_build tells what works at which tech):
+ {"a":"build","what":KIND,"n":1,"tech":1,"near":"base"|[x,z],"radius":30}   KIND = mex hydro pgen fabricator land_factory air_factory naval_factory omni radar sonar shield aa torpedo pd arty mass_storage energy_storage (or "unit_id":"ueb4202"). mex/hydro snap to free resource spots.
+ {"a":"produce","factory":"all"|"land"|"air"|"naval"|"<factory id>","what":UNITKIND,"n":5,"tech":2}   UNITKIND = engineer land_scout tank artillery land_aa air_scout fighter bomber gunship warship submarine experimental
+ {"a":"upgrade","what":"mex"|"land_factory"|"air_factory"|"naval_factory","n":2} (or "id")   {"a":"assist","target":"<id>","n":3}   {"a":"reclaim","near":[x,z],"radius":40,"n":2}   {"a":"enhance","name":"<state.acu.enhancements name>"}
+ {"a":"attack","squad":SQUAD,"x":X,"z":Z,"fraction":1.0}  (also "move", "patrol", "points":[[x,z],..], "queue":true)   {"a":"retreat","squad":SQUAD}   {"a":"stop","squad":SQUAD}   {"a":"scout","x":X,"z":Z}   {"a":"rally","factory":"all","x":X,"z":Z}
+     SQUAD = land fighters bombers gunships naval air scouts all (engineers and the ACU are never in squads). Engineers build, assist and reclaim; use state.engineers.idle_ids / idle count: idle engineers are wasted.
+Coordinates are world [x, z]. Unit ids in the state are strings. Read state.last_results: it says which orders failed and why.
+
+HOW TO PLAY WELL: mass extractors on free_mass first, power to match, a land factory, engineers, then more mex and factories; keep mass/power storage healthy (not empty, not overflowing: spend); scout early; do not feed units piecemeal; defend your commander; use the lessons below.
+
+OUTPUT FORMAT - reply with ONLY one JSON object:
+{"thoughts": "<=20 words", "notes": "<=250 chars of memory shown to you next turn", "actions": [ ... ]}
+No comments, no trailing commas."""
+
 SAMPLE_MICRO_STATE = {
     "mode": "micro", "seq": 1, "sid": 1, "t": 900, "faction": "UEF", "base": [100, 100], "map": {"w": 512, "h": 512},
     "eco": {"mass": 0.75, "energy": 0.9},
@@ -190,6 +222,9 @@ SAMPLE_STATE = {
     "enemy_near_base": {"land": 0, "air": 0, "naval": 0}, "under_attack": False,
     "enemy_starts": [{"army": 2, "pos": [400, 400]}], "last_results": [],
 }
+
+
+SAMPLE_TRAIN_STATE = dict(SAMPLE_STATE, mode="train", reward={"step": 0, "parts": {}, "episode_total": 0})
 
 
 # ------------------------------------------------------------------------------------------------
@@ -241,11 +276,11 @@ def tail_lines(path, from_start=False, poll=0.2):
 
 
 class Assembler:
-    """Collects  LLMC|S|seq|part|total|payload  chunks into whole messages."""
+    """Collects  LLMC|S|seq|part|total|payload  (state) and  LLMC|E|...  (episode summary) chunks into whole messages."""
 
-    def __init__(self, on_state, on_info, on_ack):
+    def __init__(self, on_state, on_info, on_ack, on_episode=None):
         self.parts = {}
-        self.on_state, self.on_info, self.on_ack = on_state, on_info, on_ack
+        self.on_state, self.on_info, self.on_ack, self.on_episode = on_state, on_info, on_ack, on_episode
 
     def feed(self, line):
         i = line.find(PREFIX)
@@ -259,17 +294,23 @@ class Assembler:
             elif tag == b"A":
                 f = rest.split(b"|")
                 self.on_ack(int(f[1]), int(f[2]))
-            elif tag == b"S":
+            elif tag in (b"S", b"E"):
                 f = rest.split(b"|", 4)
                 seq, part, total, payload = int(f[1]), int(f[2]), int(f[3]), f[4]
-                d = self.parts.setdefault(seq, {})
+                key = (tag, seq)
+                d = self.parts.setdefault(key, {})
                 d[part] = payload
                 if len(d) == total:
                     blob = b"".join(d[k] for k in sorted(d))
-                    del self.parts[seq]
-                    for old in [s for s in self.parts if s < seq - 3]:
+                    del self.parts[key]
+                    for old in [k for k in self.parts if k[0] == tag and k[1] < seq - 3]:
                         del self.parts[old]
-                    self.on_state(seq, json.loads(blob.decode("utf-8", "replace")))
+                    obj = json.loads(blob.decode("utf-8", "replace"))
+                    if tag == b"E":
+                        if self.on_episode:
+                            self.on_episode(seq, obj)
+                    else:
+                        self.on_state(seq, obj)
         except (ValueError, IndexError, KeyError) as e:
             print(f"[bridge] bad log line ignored ({e})")
 
@@ -283,9 +324,9 @@ class LLM:
         self.json_mode = not args.no_json_mode
         self.last_finish = None
 
-    def chat(self, messages):
+    def chat(self, messages, temperature=None):
         a = self.args
-        body = {"messages": messages, "temperature": a.temperature, "max_tokens": a.max_tokens, "stream": False}
+        body = {"messages": messages, "temperature": a.temperature if temperature is None else temperature, "max_tokens": a.max_tokens, "stream": False}
         if a.model:
             body["model"] = a.model
         if self.json_mode:
@@ -306,7 +347,7 @@ class LLM:
             if e.code == 400 and self.json_mode:
                 print("[bridge] server rejected response_format; retrying without JSON mode")
                 self.json_mode = False
-                return self.chat(messages)
+                return self.chat(messages, temperature)
             raise
         choice = data["choices"][0]
         self.last_finish = choice.get("finish_reason")
@@ -455,8 +496,18 @@ class Bridge:
         self.notes = ""
         self.prev_actions = []
         self.extra = open(args.extra_system, encoding="utf-8").read() if args.extra_system else ""
-        self.asm = Assembler(self.on_state, self.on_info, self.on_ack)
+        self.asm = Assembler(self.on_state, self.on_info, self.on_ack, self.on_episode)
         self.last_ack = 0
+        self.trainer = None            # created on the first TRAIN-mode state
+        self.pending_end = None        # episode summary waiting to be processed by the worker
+        self.episodes_done = 0
+        self.done = 0                  # highest state seq the worker has answered
+        self.last_raw, self.last_system, self.last_user = "", "", ""
+
+    def get_trainer(self):
+        if self.trainer is None:
+            self.trainer = Trainer(self.args, extract_json)
+        return self.trainer
 
     def on_info(self, text):
         print("[game]", text)
@@ -464,11 +515,17 @@ class Bridge:
             self.notes, self.prev_actions, self.last_ack = "", [], 0
             with self.cv:
                 self.latest = None
+                self.done = 0
             write_inbox(self.args.inbox, 0, 0, [], [])  # clear stale orders from a previous game
 
     def on_ack(self, seq, count):
         self.last_ack = seq
         print(f"[game] executed orders for turn {seq} ({count} actions)")
+
+    def on_episode(self, seq, summary):
+        with self.cv:
+            self.pending_end = summary
+            self.cv.notify()
 
     def on_state(self, seq, state):
         with self.cv:
@@ -483,7 +540,9 @@ class Bridge:
             "\n\nAnswer with the JSON object only."
         )
         mode = state.get("mode")
-        if mode == "army":
+        if mode == "train":
+            base_prompt = TRAIN_PROMPT + "\n\n" + self.get_trainer().context_text()
+        elif mode == "army":
             base_prompt = MICRO_PROMPT + ARMY_ADDENDUM
         elif mode in ("micro", "sacu"):
             base_prompt = GATEWAY_PROMPT
@@ -504,7 +563,9 @@ class Bridge:
         """One LLM round-trip (plus one repair retry) -> (thoughts, notes, actions, warnings)."""
         warnings = []
         msgs = self.messages(state)
-        text = self.llm.chat(msgs)
+        train = state.get("mode") == "train"
+        temp = self.get_trainer().temperature() if train else None
+        text = self.llm.chat(msgs, temp)
         truncated = self.llm.last_finish == "length"
         try:
             obj, note = extract_json(text)
@@ -519,7 +580,7 @@ class Bridge:
                  ". Reply again with ONLY one valid JSON object: {\"thoughts\":\"...\",\"notes\":\"...\",\"actions\":[...]}. "
                  "Keep thoughts under 15 words and use at most 12 actions."},
             ]
-            text = self.llm.chat(retry)
+            text = self.llm.chat(retry, temp)
             truncated = self.llm.last_finish == "length"
             try:
                 obj, note = extract_json(text)          # raises if still broken
@@ -534,17 +595,55 @@ class Bridge:
             print("[bridge] reply hit max_tokens - consider raising --max-tokens")
         micro = state.get("mode") in ("micro", "army", "sacu")
         acts = sanitize_actions(obj.get("actions", []), warnings, min(self.args.max_actions, 12) if micro else self.args.max_actions,
-                                (MICRO_ACTIONS if state.get("mode") == "army" else GATEWAY_ACTIONS) if micro else None)
+                                TRAIN_ACTIONS if train else ((MICRO_ACTIONS if state.get("mode") == "army" else GATEWAY_ACTIONS) if micro else None))
+        self.last_raw, self.last_system, self.last_user = text, msgs[0]["content"], msgs[1]["content"]
         notes = str(obj.get("notes", ""))[:400]
         return str(obj.get("thoughts", ""))[:300], notes, acts, warnings
 
+    def handle_episode_end(self, summary):
+        write_inbox(self.args.inbox, 0, 0, [], [])          # no stale orders for the next match
+        if self.trainer is not None:
+            self.trainer.end_episode(summary, self.llm)
+        self.episodes_done += 1
+        stopping = bool(self.args.max_episodes and self.episodes_done >= self.args.max_episodes)
+        if stopping:
+            nxt = ("TRAINING STOPPED: --max-episodes %d reached. When you want to continue, resume with the command above, then START A NEW GAME."
+                   % self.args.max_episodes)
+        elif self.args.restart_cmd:
+            nxt = ("NEXT: A NEW GAME IS STARTING - the restart command was run: %s\n"
+                   " If no new game appears, START A NEW GAME YOURSELF; the bridge continues automatically when it does." % self.args.restart_cmd)
+        else:
+            nxt = "NEXT: START A NEW GAME NOW (no --restart-cmd was given). The bridge continues automatically as soon as the new game begins."
+        if self.trainer is not None:
+            self.trainer.announce(nxt)
+        if stopping:
+            os._exit(0)
+        if self.args.restart_cmd:
+            try:
+                subprocess.Popen(self.args.restart_cmd, shell=True)
+            except OSError as e:
+                print("[train] restart command failed:", e)
+
     def worker(self):
-        done = 0
         while True:
             with self.cv:
-                while self.latest is None or self.latest[0] <= done:
+                while self.pending_end is None and (self.latest is None or self.latest[0] <= self.done):
                     self.cv.wait()
-                seq, state = self.latest
+                end = self.pending_end
+                self.pending_end = None
+                seq, state = (None, None) if end is not None else self.latest
+            if end is not None:
+                try:
+                    self.handle_episode_end(end)
+                except Exception as e:
+                    print(f"[train] episode end handling failed: {type(e).__name__}: {e}")
+                continue
+
+            train = state.get("mode") == "train"
+            if train:
+                tr = self.get_trainer()
+                tr.begin(state.get("sid"))
+                tr.on_state(state)                     # reward of the previous step arrives with this state
             t0 = time.time()
             try:
                 thoughts, notes, acts, warnings = self.decide(state)
@@ -552,12 +651,18 @@ class Bridge:
                 print(f"[bridge] turn {seq}: LLM call failed: {type(e).__name__}: {e}")
                 write_inbox(self.args.inbox, state.get("sid", 0), seq, [],
                             [f"your last reply was unusable ({str(e)[:60]}); reply with ONE valid JSON object"])
-                done = seq
+                self.done = seq
                 continue
-            done = seq
+            self.done = seq
+            with self.cv:
+                ended = self.pending_end is not None
+            if ended:                                   # the episode finished while the model was thinking
+                continue
             if notes:
                 self.notes = notes
             self.prev_actions = acts
+            if train:
+                self.trainer.record(state, self.last_system, self.last_user, self.last_raw, thoughts, notes, acts)
             write_inbox(self.args.inbox, state.get("sid", 0), seq, acts, warnings)
             print(f"[bridge] turn {seq} (game t={state.get('t')}s) {time.time() - t0:.1f}s, {len(acts)} actions")
             if thoughts:
@@ -589,7 +694,7 @@ def selftest(args):
     b = Bridge(args)
     print("Sending a sample state to", args.server, "...")
     t0 = time.time()
-    thoughts, notes, acts, warnings = b.decide((SAMPLE_ARMY_STATE if args.selftest_mode == "army" else dict(SAMPLE_MICRO_STATE, mode=args.selftest_mode)) if args.selftest_mode in ("micro", "sacu", "army") else SAMPLE_STATE)
+    thoughts, notes, acts, warnings = b.decide(SAMPLE_TRAIN_STATE if args.selftest_mode == "train" else ((SAMPLE_ARMY_STATE if args.selftest_mode == "army" else dict(SAMPLE_MICRO_STATE, mode=args.selftest_mode)) if args.selftest_mode in ("micro", "sacu", "army") else SAMPLE_STATE))
     print(f"reply in {time.time() - t0:.1f}s\nthoughts: {thoughts}\nnotes: {notes}\nactions:")
     for x in acts:
         print("  ", json.dumps(x))
@@ -613,17 +718,29 @@ def main():
     p.add_argument("--no-json-mode", action="store_true", help="do not send response_format=json_object")
     p.add_argument("--extra-system", help="text file appended to the system prompt (e.g. '/no_think' or personality)")
     p.add_argument("--from-start", action="store_true", help="read the log from its beginning instead of its end")
-    p.add_argument("--selftest-mode", choices=["micro", "sacu", "army", "full"], default="micro", help="which game mode the --selftest sample state is for")
+    p.add_argument("--train-dir", default=os.path.join(here, "train"), help="TRAIN mode: where episode logs, lessons.json, stats.csv and dataset.jsonl go")
+    p.add_argument("--temp-start", type=float, default=0.9, help="TRAIN: sampling temperature in the first episode (exploration)")
+    p.add_argument("--temp-end", type=float, default=0.3, help="TRAIN: temperature after --temp-episodes episodes (exploitation)")
+    p.add_argument("--temp-episodes", type=int, default=30)
+    p.add_argument("--gamma", type=float, default=0.97, help="TRAIN: discount for the logged return-to-go")
+    p.add_argument("--restart-cmd", default="", help="TRAIN: shell command that restarts the match after an episode (see README)")
+    p.add_argument("--max-episodes", type=int, default=0, help="TRAIN: stop after this many episodes (0 = never)")
+    p.add_argument("--selftest-mode", choices=["micro", "sacu", "army", "train", "full"], default="micro", help="which game mode the --selftest sample state is for")
     p.add_argument("--selftest", action="store_true", help="query the LLM once with a sample state and exit")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
     if args.selftest:
         selftest(args)
     else:
+        bridge = None
         try:
-            Bridge(args).run()
+            bridge = Bridge(args)
+            bridge.run()
         except KeyboardInterrupt:
             print("\n[bridge] bye")
+            if bridge is not None and bridge.trainer is not None:
+                print("[train] stopped. Playbook: %s\n[train] To resume in a new session, run the same command again:\n   %s" % (
+                    os.path.abspath(bridge.trainer.lessons_path), bridge.trainer.resume_command()))
 
 
 if __name__ == "__main__":
