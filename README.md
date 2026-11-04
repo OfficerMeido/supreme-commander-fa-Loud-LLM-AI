@@ -4,11 +4,15 @@ I wanted to have a mod like but i could not find one so i asked claude.ai to mak
 Qwen3.8-9B-Distill-GGUF
 Download it here https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/blob/main/Qwen3.8-9B-Q8_0.gguf
 
-# What i want to add
+# What i am planning to vibe code
 
-add a Train mode in where your local LLM server will learn to play and improve via trail and error against a  LOUD AI.
+selecting what mode the LLM will run at start instead of editing lua/LLMC/Config.lua eg
 
-LOUD AI is very good at playing the game so i am hoping it will learn to beat it
+
+#Change Log
+04/11/2026
+Added train mode testing
+
 
 # LLM Commander (Supreme Commander: Forged Alliance + LOUD)
 
@@ -20,7 +24,7 @@ Skirmish vs AI only. **Not multiplayer-safe** (the sim reads a local file, so ot
 A local LLM (llama.cpp `llama-server`, Ollama, LM Studio, anything OpenAI-compatible) plays one army.
 Skirmish vs AI only. **Not multiplayer-safe** (the sim reads a local file, so other clients would desync).
 
-**Status: written without access to a running game. Untested in-engine.** See "Assumptions" below.
+
 
 ## Modes (`Takeover` in `lua/LLMC/Config.lua`)
 - **`micro` (default): LOUD plays everything; the LLM controls ONLY the Quantum Gateway ACUs (SACUs).** LOUD keeps its economy,
@@ -39,6 +43,7 @@ Skirmish vs AI only. **Not multiplayer-safe** (the sim reads a local file, so ot
   raid. Because replies take seconds, units left idle for `IdleFallbackSeconds` (25) gather at a staging point in front of
   the base towards the nearest enemy (`StagingDistance`, change it with the `rally` action) instead of standing at the factory.
   Set `Takeover = 'army'` in `Config.lua`; try it with `--selftest --selftest-mode army`.
+- **`train`:** the LLM plays the whole game with no macro and no rule gates and *learns from a reward function* - see "Train mode" below.
 - **`replace`:** the AI slot's built-in AI is switched off and the LLM + macro manager play it (everything below).
 - **`overlay`:** like `replace` but the built-in AI is left running.
 In `micro` mode the LLM's army is the highest-numbered AI slot (or `Config.Army`): add a LOUD AI player in the lobby as usual.
@@ -65,6 +70,81 @@ the prompt tells the LLM to ignore building defences, and the rescue watchdog bu
 mass fabricators when energy floats, factories, mex upgrades, units, AA/PD if attacked) and switches off again once
 resources are used (`Rescue = false` disables). It never starts attack waves in this mode.
 Known limit: a local LLM answers in seconds, so orders arrive a bit late; select by area and let the hold timeout return units.
+
+## Train mode (`Takeover = 'train'`): the LLM learns the game by trial and error
+The slot's built-in AI is switched off and the LLM plays the **whole game** (economy, tech, production, attack) with **no macro
+manager and none of the rule gates** - everything the earlier rules enforced is now something it has to learn from reward.
+Opponent: a LOUD AI in another slot, or a human player. Each match is one *training step* (episode); it ends when an army is
+destroyed (`TrainEndOnAnyArmy = true`: as soon as any army dies; `false`: only when all enemies are dead, or your own dies), or after
+`TrainMaxSeconds` (timeout).
+
+**Reward** (`lua/LLMC/Reward.lua`; the LLM sees `state.reward.step / parts / episode_total` every turn):
+
+| event | reward |
+|---|---|
+| destroy an enemy unit / building | +3 |
+| destroy an enemy Tech 4 | +6 |
+| destroy an enemy with an artillery installation | +4 |
+| destroy an enemy with a nuke | +8 |
+| finish producing a unit | +2 |
+| finish producing a Tech 4 unit | +8 |
+| mass **and** power storage both above 30% (each `TrainEcoInterval`, 10 s) | +2 x scale |
+| power storage at 100% | +3 x scale |
+| mass storage at 80% or more | +4 x scale |
+| mass wasted (storage full and overflowing) | -6 |
+| power storage under 20% | -2 |
+| power at 0 | -4 |
+| mass at 0 | -4 |
+| lose a unit | -1 |
+| lose a building | -3 |
+| lose a mass extractor | -4 (instead of the building penalty) |
+| **WIN** (enemy army destroyed) | **+500** (`WinReward`) **+ speed bonus** up to +300, linearly down to 0 at 2 h (`WinSpeedBonus`, `WinSpeedHorizon`) |
+| **LOSS** (your army destroyed) | **-500** (`LossReward`) |
+| timeout (no winner within `TrainMaxSeconds`) | -250 (`TimeoutReward`) |
+| every game minute | -5 (`TimePenaltyPerMinute`), at most -250 in total (`TimePenaltyCap`) |
+
+**Game length:** short games last 20-30 minutes, long ones 1-3 hours, and the opponent gets tougher the longer a game runs - so early wins are worth
+the most: the end-of-game reward for a win is +750 after 20 minutes (500 + 250 speed bonus), +650 after 1 hour, +500 after 2 hours or more, against -500 for a loss.
+The running time cost (-5/min) is capped (`TimePenaltyCap`) and the economy-reward cap grows by `EcoRewardCap` for every 30 minutes of play, so long games keep their economy guidance.
+`TrainMaxSeconds` is now 10800 (3 h). For a first run consider a lower value (e.g. 2400) against an easier AI, then raise it as the model learns to win early.
+
+**Training to win:** the terminal rewards dominate on purpose. The positive economy rewards (`x scale`) are multiplied by `EcoRewardScale` (0.25) and
+capped at `EcoRewardCap` (300) per 30 minutes of play, so a big economy can never outscore a win; the penalties keep their full value; the per-minute cost
+rewards winning fast. The prompt and the reflection step both tell the model that the goal is to win and to call out stalling/unit-spam.
+
+Interpretation choices (change in `Config.lua`): the kill rewards do not stack - a kill is worth the *highest* applicable value
+(`RewardMode = 'sum'` adds them instead); the economy rewards are evaluated every 10 game seconds, not every tick; "power at 0" /
+"mass at 0" replace the "power under 20%" penalty at zero. Walls and unfinished/cancelled structures are ignored. Kill, produce and
+loss events come from a hook on `Unit:OnKilled` / `Unit:OnStopBeingBuilt` (`hook/lua/sim/Unit.lua`); artillery and nuke kills are
+recognised by the killer's blueprint categories (`ARTILLERY`+`STRUCTURE`, `NUKE`).
+
+**How it learns** - be clear about what is and isn't happening: a llama.cpp / Ollama server **cannot update its own weights while
+serving**. So:
+1. *In-context learning (automatic).* After every episode the bridge asks the model to reflect on the result, the reward breakdown
+   and a per-2-minute timeline, and to rewrite its **playbook** (`train/lessons.json`: <=14 lessons, <=8 mistakes to avoid, one
+   experiment to try next). The playbook, the experiment, the recent returns and the best run's opening are put in the prompt of every
+   later turn. The sampling temperature starts high (`--temp-start 0.9`) and decays (`--temp-end 0.3` over `--temp-episodes 30`) so
+   early episodes explore.
+2. *Offline fine-tuning (optional).* Every step is logged with its reward and return-to-go (`train/dataset.jsonl`, `train/episodes/`).
+   `python bridge/train_export.py --top 0.3 --min-rtg 20 --out sft.jsonl` writes the best episodes as a chat-format SFT set to train a
+   LoRA elsewhere (Unsloth, axolotl, ...), merge it, convert to GGUF, serve it and keep training with the better model.
+
+**Running it**
+```
+python bridge/llm_bridge.py --log <game log> --server http://127.0.0.1:8080/v1 --restart-cmd "<command that restarts the match>" --max-episodes 50
+```
+The mod cannot restart a match from inside the game, so at the end of an episode the bridge (after reflecting and saving) runs
+`--restart-cmd` - e.g. a script that kills the game and relaunches it into your saved skirmish setup (an AutoHotkey script or batch
+file you write for your own LOUD launcher). Without `--restart-cmd` it prints a message and simply continues when you start the next
+match. When an episode ends the bridge prints a banner (and appends it to `bridge/train/train.log`; the game log gets a matching `LLMC|I|EPISODE HAS ENDED` line) that says
+the episode ended, where the playbook (`lessons.json`) and logs are saved, the exact command to **resume in a new session** (run it again with the same `--train-dir`;
+it continues at the next episode with the saved playbook) and what to do next: start a new game. Files in `bridge/train/`: `stats.csv` (one row per episode: result, return, kills, losses, ...), `lessons.json`, `best.json`,
+`episodes/ep_NNNN.jsonl` (every step), `dataset.jsonl`, `prompts/`. Self-test: `--selftest --selftest-mode train`.
+
+**Things to know:** the reward can be gamed - producing units pays +2 each (cheap scouts/engineers count), and sitting on full storage
+pays +3/+4 per 10 s, which can outweigh fighting; the reflection step sees the breakdown and usually notices, but watch `stats.csv`
+(kills vs. units built). Whether `OnKilled`'s instigator and the nuke category look the way I assumed in LOUD is untested; if the
+breakdown never shows `kill_artillery` / `kill_nuke` that is the first thing to check.
 
 ## How it works
 Supreme Commander's sandboxed Lua cannot open sockets, so a small Python script bridges the gap:
