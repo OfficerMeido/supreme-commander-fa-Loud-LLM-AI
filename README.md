@@ -11,7 +11,7 @@ selecting what mode the LLM will run at start instead of editing lua/LLMC/Config
 
 # Change Log
 04/11/2026
-Added train mode testing
+Added train mode - idk how well it works yet
 
 
 # LLM Commander (Supreme Commander: Forged Alliance + LOUD)
