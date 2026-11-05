@@ -2,8 +2,22 @@
 
 ## ⚠️ Important
 > **This is Very Buggy!** I can't fix bugs without Claude.ai, or make improvements either.
-
+> **This is Not tested on Windows this was tested on Linux running supreme commander under wine** idk if it will work on Windows or not but it should long as you got python installed.
 ---
+
+## Install
+1. Copy the `LLMCommander` folder into the mods folder your LOUD install uses (next to its other mods).
+   **The folder must be named exactly `LLMCommander`.**
+2. Start the game with a log file, e.g. add `/log "Loud-Dev.log"` (LOUD's dev shortcut already has it).
+3. Start your LLM server, e.g. `llama-server -m model.gguf -c 8192 --port 8080`.
+4. Test the model without the game: `python bridge/llm_bridge.py --selftest --server http://127.0.0.1:8080/v1`
+5. Run the bridge: `python bridge/llm_bridge.py --log <path to that log file> --server http://127.0.0.1:8080/v1`
+   (or edit and use `run_bridge.bat`). Ollama: `--server http://localhost:11434/v1 --model <name>`.
+6. In the lobby: enable the **LLM Commander** mod and add a LOUD AI player. In the default `micro` mode the LLM micro-manages
+   the combat units of the highest-numbered AI slot while LOUD keeps playing it; in `replace` mode that slot's built-in AI is switched off. Other AIs stay normal opponents.
+7. Slow the game down (lobby game speed / `-` key) if your model needs many seconds per reply; the game does not wait for the LLM.
+
+In `replace` mode look for `LLMC|I|INFO built-in AI disabled for ARMY_n` in the game log; in `micro` mode look for `mode=micro` in the `controlling ARMY_n` line and `[game] executed orders...` in the bridge console.
 
 ## 🤖 Recommend Models
 
@@ -170,19 +184,9 @@ last orders did). The LLM answers with a JSON list of high-level orders (`build`
 LOUD's units), finds legal build spots, and issues the commands. Every order is validated; the file the
 game loads is plain Lua literals run in an empty environment.
 
-## Install
-1. Copy the `LLMCommander` folder into the mods folder your LOUD install uses (next to its other mods).
-   **The folder must be named exactly `LLMCommander`.**
-2. Start the game with a log file, e.g. add `/log "Loud-Dev.log"` (LOUD's dev shortcut already has it).
-3. Start your LLM server, e.g. `llama-server -m model.gguf -c 8192 --port 8080`.
-4. Test the model without the game: `python bridge/llm_bridge.py --selftest --server http://127.0.0.1:8080/v1`
-5. Run the bridge: `python bridge/llm_bridge.py --log <path to that log file> --server http://127.0.0.1:8080/v1`
-   (or edit and use `run_bridge.bat`). Ollama: `--server http://localhost:11434/v1 --model <name>`.
-6. In the lobby: enable the **LLM Commander** mod and add a LOUD AI player. In the default `micro` mode the LLM micro-manages
-   the combat units of the highest-numbered AI slot while LOUD keeps playing it; in `replace` mode that slot's built-in AI is switched off. Other AIs stay normal opponents.
-7. Slow the game down (lobby game speed / `-` key) if your model needs many seconds per reply; the game does not wait for the LLM.
+## Install (moved to top)
 
-In `replace` mode look for `LLMC|I|INFO built-in AI disabled for ARMY_n` in the game log; in `micro` mode look for `mode=micro` in the `controlling ARMY_n` line and `[game] executed orders...` in the bridge console.
+
 
 ## Built-in macro manager (v2)
 `lua/LLMC/Macro.lua` plays the routine game like the stock AI, every 6 game seconds, regardless of LLM speed:
