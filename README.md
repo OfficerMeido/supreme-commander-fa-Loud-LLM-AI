@@ -1,8 +1,20 @@
-# Note i am Not a programmer
-I wanted to have a mod like but i could not find one so i asked claude.ai to make one. I can't fix bugs with out claude ai or make improvements. Note This is Very Buggy.
-# Recommend Models
-Qwen3.8-9B-Distill-GGUF
-Download it here https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/blob/main/Qwen3.8-9B-Q8_0.gguf
+> _Note: I'm not a programmer. I wanted to have a mod like this, but I couldn't find one, so I asked [Claude.ai](https://claude.ai) to make one._
+
+## ⚠️ Important
+> **This is Very Buggy!** I can't fix bugs without Claude.ai, or make improvements either.
+
+---
+
+## 🤖 Recommend Models
+
+| Model | Notes |Get it Here|
+|-------|-------|-----------|
+| **Qwen3.8-9B-Distill-GGUF** | Any of the GGUF variants work fine. Turn reasoning off with `-rea off` |[Qwen3.8-9B-Distill-GGUF](https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/tree/main)
+
+---
+
+
+
 
 # What i am planning to vibe code
 - selecting what mode the LLM will run at start instead of editing lua/LLMC/Config.lua eg
