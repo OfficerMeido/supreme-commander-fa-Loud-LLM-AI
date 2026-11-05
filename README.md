@@ -34,6 +34,7 @@ In `replace` mode look for `LLMC|I|INFO built-in AI disabled for ARMY_n` in the 
 # What i am planning to vibe code
 - selecting what mode the LLM will run at start instead of editing lua/LLMC/Config.lua eg
 - In short nearsightedness i didn't tell claude to have the LLM wait for previous orders and build que to be completed  before issuing new ones on the same unit or engineers i think this causes the LLM to keep issuing the same order i think.
+- Auto match restart for train mode
 
 # Change Log
 04/11/2026
