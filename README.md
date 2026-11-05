@@ -5,8 +5,9 @@ Qwen3.8-9B-Distill-GGUF
 Download it here https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/blob/main/Qwen3.8-9B-Q8_0.gguf
 
 # What i am planning to vibe code
-selecting what mode the LLM will run at start instead of editing lua/LLMC/Config.lua eg
-In short nearsightedness i didn't tell claude to have the LLM wait for previous orders and build que to be completed  before issuing new ones on the same unit or engineers i think this causes the LLM to keep issuing the same thing.
+- selecting what mode the LLM will run at start instead of editing lua/LLMC/Config.lua eg
+- 
+- In short nearsightedness i didn't tell claude to have the LLM wait for previous orders and build que to be completed  before issuing new ones on the same unit or engineers i think this causes the LLM to keep issuing the same thing.
 
 # Change Log
 04/11/2026
