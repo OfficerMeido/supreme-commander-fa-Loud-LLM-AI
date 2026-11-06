@@ -23,9 +23,10 @@ import time
 import urllib.error
 import urllib.request
 
-BRIDGE_VERSION = 6
+BRIDGE_VERSION = 7
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from trainer import Trainer  # noqa: E402  (TRAIN mode bookkeeping)
+import menu  # noqa: E402  (start-up mode menu)
 
 PREFIX = b"LLMC|"
 
@@ -181,8 +182,12 @@ There is NO macro manager and NO safety rules: you run everything yourself - eco
 REWARD - what you are trained to maximise (state.reward.step = reward earned since your last turn, state.reward.parts = which rewards, state.reward.episode_total = running total):
  + KILLS: enemy unit or building destroyed +3; enemy Tech 4 +6; killed by your artillery installation +4; killed by your nuke +8 (the highest applicable one counts)
  + PRODUCTION: every unit you finish +2; every Tech 4 unit +8
- + ECONOMY (checked every 10 game seconds): mass AND power storage both above 30% +2; power storage full +3; mass storage at 80% or more +4 - but these positive economy rewards are multiplied by 0.25 and capped at 300 per 30 minutes of play, so they guide you without being the point
- - PENALTIES: mass wasted (storage full and overflowing) -6; power storage under 20% -2; power at 0 -4; mass at 0 -4
+ + COMBAT UNITS: every combat unit you finish (land, air, naval - not engineers or scouts) pays an EXTRA +2, PLUS +0.5 for each other combat unit finished in the previous 60 seconds (up to +5), so one unit is worth 2 to 7. A high production RATE pays far more than trickling units out: keep several factories busy and queue units in batches.
+ + DEFENCE STRUCTURES: every point-defence, anti-air, torpedo or shield structure you finish pays +3 x its tier (T1 +3, T2 +6, T3 +9), at most 150 per 30 minutes of play.
+ - NO ARMY: after the first 4 minutes, every 10-second check in which you finished NO combat unit during the previous 90 seconds costs -2 (at most -300 per 30 minutes). You cannot win without an army: get a factory producing combat units early and keep it producing.
+ + ECONOMY (checked every 10 game seconds; this follows how the Supreme Commander economy works - INCOME wins games, stockpiles are only a buffer, anything beyond your storage is wasted):
+     mass income +0.4 per mass/second; power supply keeping up with demand (energy income >= energy demand) +3; a healthy buffer (mass storage between 30% and 95% AND power storage above 30%) +2; every mass extractor upgrade that finishes: T2 +10, T3 +20 (an upgrade TRIPLES an extractor's mass). These positive economy rewards are multiplied by 0.25 and capped at 300 per 30 minutes of play, so they guide you without being the point.
+ - STALLS and WASTE (full value): mass at 0 -4 (construction halts); power at 0 -4 and power storage under 20% -2 (an energy shortage also switches off radar and shield generators and slows every factory and engineer); mass wasted (mass storage full and still overflowing) -6. Power overflow is normal and NOT penalised: power income is always far larger than mass income (+1000 energy with +1 mass is fine) - but unspent MASS above capacity is simply lost, so spend it.
  - LOSSES: every unit lost -1; every building lost -3; every mass extractor lost -4
  *** THE BIG ONE - THE GOAL IS TO WIN: destroying the enemy army (kill its commander and base) gives +500, PLUS a speed bonus of up to +300 for winning early (about +250 for a win after 20 minutes, +150 after 1 hour, nothing after 2 hours); having your own army destroyed gives -500; running out the clock (3 hours) without a winner gives -250; every game minute costs -5 (at most -250 in total). THE LONGER A GAME RUNS THE TOUGHER THE OPPONENT GETS (short games last 20-30 minutes, long games 1-3 hours): expand and tech fast, then attack - do not turtle and hope. state.reward.rules shows the current values. Economy points alone can never beat a win, so build a strong economy as a MEANS to build an army, find the enemy and destroy it. ***
 The episode (training step) ends when an army is destroyed - yours or the enemy's. Then the match restarts and you see lessons written from your past episodes. Maximise the TOTAL, which is dominated by winning: destroy the enemy commander and army as fast as you safely can; losing your own commander costs -500.
@@ -195,7 +200,14 @@ ORDERS (each is an object with key "a"; at most 24 per turn; state.can_build tel
      SQUAD = land fighters bombers gunships naval air scouts all (engineers and the ACU are never in squads). Engineers build, assist and reclaim; use state.engineers.idle_ids / idle count: idle engineers are wasted.
 Coordinates are world [x, z]. Unit ids in the state are strings. Read state.last_results: it says which orders failed and why.
 
-HOW TO PLAY WELL: mass extractors on free_mass first, power to match, a land factory, engineers, then more mex and factories; keep mass/power storage healthy (not empty, not overflowing: spend); scout early; do not feed units piecemeal; defend your commander; use the lessons below.
+HOW BUILDING WORKS - read this, it is the most common mistake: build orders QUEUE behind whatever the builder is already doing, and structures take a long time. The ACU and each engineer work through their queue ONE JOB AT A TIME. So do NOT order more of something that is already being built:
+ - state.under_construction = what is being built right now (e.g. {"land_factory":1}); state.acu.queued_jobs = the ACU's queue length; state.alerts = plain-language problems to fix FIRST.
+ - WAIT FOR ORDERS TO FINISH (important): a builder, factory or unit takes a NEW order only when it has finished the previous ones. Engineers and the ACU accept build orders only while idle (state.engineers.idle_ids, state.acu.idle) and then up to 3 jobs in ONE turn; a factory accepts a produce order only when its queue is EMPTY (factories[].idle) - you may give it up to 3 produce orders in the SAME turn - put ENGINEERS first, then combat units (e.g. engineer x3, then tank x10) - and it works through them while you wait; combat units accept attack/move/patrol/scout orders only when idle (retreat and stop always work). Orders to busy ones are refused: do NOT repeat them, wait.
+ - Orders for a kind that is already under construction or queued are also REFUSED (limits at a time: 1 factory of each type, 3 pgen, 4 mex, ...). Read state.last_results for these refusals and give DIFFERENT orders to the builders that ARE idle instead of repeating yourself.
+ - POWER COMES FIRST: everything costs energy. If state.alerts says power is low, or energy income is below demand, build pgen BEFORE anything else - but ONLY while power is actually short: once storage is nearly full and income >= demand, more pgen are refused and useless (state.alerts says so). Never answer with only factories, and never with only pgen.
+ECONOMY FACTS (from the game's wiki): mass comes mostly from mass extractors - T1 +2 M/s for 2 E/s upkeep, upgraded to T2 +6 M/s for 9 E/s, T3 about 12-18 M/s for 36-54 E/s - so UPGRADING extractors is the cheapest way to multiply income. Energy comes from power generators (T1 pgen 20 E/s, hydrocarbon plant 100 E/s on its special spots, T2 pgen 500 E/s, T3 2500 E/s) and everything draws on it; mass fabricators turn a LOT of energy into a little mass (about 150 E per 1 M for a T2 fab) - only worth it with surplus power. Storage buildings only add capacity. Resources must be stored: income that does not fit is wasted, so keep spending it. Time is the key: more income sooner means more units sooner.
+OPENING (first ~3 minutes): the ACU is idle at the start, so give it its three jobs in ONE turn: mex x2 (near free_mass), pgen x2, then ONE land_factory, and then let it work. When the factory exists: produce engineer x3 FIRST, then in the same turn tank x10. AFTER THE OPENING (about 4 mex, 2-4 pgen): as soon as the factory exists START PRODUCING COMBAT UNITS (tank / fighter / ..., batches of n=10) and keep EVERY factory producing - an army that does not exist costs reward after 4 minutes. Engineers: more mex on free_mass and mex upgrades, a second factory, defences, radar; build power ONLY while it is short (do not keep ordering pgen - after the first few it is rarely needed). Spread orders over DIFFERENT kinds each turn (mex, engineers, factory, units, defences...), and use idle engineers.
+Also: never let mass or power run empty, and spend mass before it overflows (power overflow does not matter - big power income with small mass income is normal); scout early; do not feed units piecemeal; defend your commander; use the lessons below.
 
 OUTPUT FORMAT - reply with ONLY one JSON object:
 {"thoughts": "<=20 words", "notes": "<=250 chars of memory shown to you next turn", "actions": [ ... ]}
@@ -273,6 +285,43 @@ def tail_lines(path, from_start=False, poll=0.2):
                 f.close()
             f = None
             time.sleep(1.0)
+
+
+def train_checklist(state):
+    """Plain-language 'do this now' list built from the state - small models forget engineers and moving their army."""
+    items = []
+    eng = state.get("engineers") or {}
+    n_eng = eng.get("total", 0) or 0
+    facs = [f for f in (state.get("factories") or []) if f.get("idle") and not f.get("upgrading")]
+    if facs:
+        ids = [str(f.get("id")) for f in facs][:4]
+        if n_eng < 4:
+            items.append('IDLE FACTORIES %s and you have only %d engineers: produce ENGINEERS first, e.g. {"a":"produce","factory":"%s","what":"engineer","n":%d}, and in the SAME turn queue combat units after them, e.g. {"a":"produce","factory":"%s","what":"tank","n":10}.'
+                         % (ids, n_eng, ids[0], max(2, 5 - n_eng), ids[0]))
+        else:
+            items.append('IDLE FACTORIES %s: queue combat units, e.g. {"a":"produce","factory":"%s","what":"tank","n":10} (fighters/bombers from an air factory).' % (ids, ids[0]))
+    army = state.get("army") or {}
+    idle_units = sum((v or {}).get("idle", 0) for k, v in army.items() if k != "scouts")
+    total_units = sum((v or {}).get("n", 0) for k, v in army.items() if k != "scouts")
+    if idle_units > 0:
+        tgt = None
+        for c in state.get("contacts") or []:
+            if c.get("pos"):
+                tgt = c["pos"]
+                break
+        if tgt is None:
+            for e in state.get("enemy_starts") or []:
+                if e.get("pos"):
+                    tgt = e["pos"]
+                    break
+        where = ('toward the enemy at %s,%s, e.g. {"a":"attack","squad":"land","x":%s,"z":%s}' % (tgt[0], tgt[1], tgt[0], tgt[1])) if tgt else 'to a gathering point or to scout'
+        items.append("%d of your %d combat units are IDLE - an idle army earns nothing: move them %s" % (idle_units, total_units, where))
+    idle_eng = eng.get("idle_ids") or []
+    if idle_eng:
+        items.append("IDLE ENGINEERS %s: give each a job (mass extractor on free_mass, a factory, defences, assist an upgrade)." % idle_eng[:8])
+    if not items:
+        return "TURN CHECKLIST: nothing is idle right now - do NOT repeat earlier orders; plan the next steps or wait."
+    return "TURN CHECKLIST (do these THIS turn, in this order; skip what does not apply):\n- " + "\n- ".join(items)
 
 
 class Assembler:
@@ -477,9 +526,25 @@ def sanitize_actions(raw, warnings, limit, allowed=None):
     return acts
 
 
-def write_inbox(path, sid, seq, actions, warnings):
-    text = "LLMC_INBOX = { sid = %s, seq = %d, actions = %s, warnings = %s }\n" % (
-        lua(sid), seq, lua(actions), lua([w[:100] for w in warnings[:10]]))
+def write_restart_token(bridge_dir):
+    """Ask the game's UI to restart the match: write a NEW token to bridge/restart.lua (see hook/lua/UserSync.lua)."""
+    path = os.path.join(bridge_dir, "restart.lua")
+    old = 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = re.search(r"token\s*=\s*(\d+)", f.read())
+            old = int(m.group(1)) if m else 0
+    except OSError:
+        pass
+    token = max(old + 1, int(time.time()))
+    with open(path, "w", newline="\n") as f:
+        f.write("-- Written by llm_bridge.py after an episode: a NEW token asks the game's UI to restart the match.\nLLMC_RESTART = { token = %d }\n" % token)
+    return token
+
+
+def write_inbox(path, sid, seq, actions, warnings, restart=False):
+    text = "LLMC_INBOX = { sid = %s, seq = %d, actions = %s, warnings = %s%s }\n" % (
+        lua(sid), seq, lua(actions), lua([w[:100] for w in warnings[:10]]), ", restart = true" if restart else "")
     with open(path, "w", newline="\n") as f:
         f.write(text)
 
@@ -502,6 +567,9 @@ class Bridge:
         self.pending_end = None        # episode summary waiting to be processed by the worker
         self.episodes_done = 0
         self.done = 0                  # highest state seq the worker has answered
+        self.mode_checked = False
+        self.last_sid = 0
+        self.restart_pending = False
         self.last_raw, self.last_system, self.last_user = "", "", ""
 
     def get_trainer(self):
@@ -513,6 +581,10 @@ class Bridge:
         print("[game]", text)
         if text.startswith("START"):
             self.notes, self.prev_actions, self.last_ack = "", [], 0
+            self.mode_checked = False
+            if self.restart_pending:
+                self.restart_pending = False
+                print("[train] the new match has started - the automatic restart worked.")
             with self.cv:
                 self.latest = None
                 self.done = 0
@@ -528,6 +600,14 @@ class Bridge:
             self.cv.notify()
 
     def on_state(self, seq, state):
+        self.last_sid = state.get("sid", self.last_sid)
+        exp = getattr(self.args, "mode", None)
+        if exp and not self.mode_checked and exp not in ("replace", "overlay"):
+            self.mode_checked = True
+            actual = state.get("mode")
+            if actual != exp:
+                print(f"[bridge] WARNING: you chose '{exp}' but the running game reports mode '{actual or 'replace/overlay'}'. "
+                      f"The mod reads the mode when a match STARTS - restart the game (the bridge wrote {os.path.join(os.path.dirname(os.path.abspath(self.args.inbox)), 'mode.lua')}).")
         with self.cv:
             self.latest = (seq, state)
             self.cv.notify()
@@ -540,6 +620,8 @@ class Bridge:
             "\n\nAnswer with the JSON object only."
         )
         mode = state.get("mode")
+        if mode == "train":
+            user = user.replace("\n\nAnswer with the JSON object only.", "\n\n" + train_checklist(state) + "\n\nAnswer with the JSON object only.")
         if mode == "train":
             base_prompt = TRAIN_PROMPT + "\n\n" + self.get_trainer().context_text()
         elif mode == "army":
@@ -606,14 +688,18 @@ class Bridge:
             self.trainer.end_episode(summary, self.llm)
         self.episodes_done += 1
         stopping = bool(self.args.max_episodes and self.episodes_done >= self.args.max_episodes)
+        game_restart = (not stopping) and (not self.args.restart_cmd) and (not self.args.no_game_restart)
         if stopping:
             nxt = ("TRAINING STOPPED: --max-episodes %d reached. When you want to continue, resume with the command above, then START A NEW GAME."
                    % self.args.max_episodes)
         elif self.args.restart_cmd:
             nxt = ("NEXT: A NEW GAME IS STARTING - the restart command was run: %s\n"
                    " If no new game appears, START A NEW GAME YOURSELF; the bridge continues automatically when it does." % self.args.restart_cmd)
+        elif game_restart:
+            nxt = ("NEXT: THE MOD RESTARTS THE MATCH ITSELF now (RestartSession, the same call LOUD's menu uses) - the playbook is saved.\n"
+                   " If no new game appears within a minute, START A NEW GAME YOURSELF; the bridge continues automatically.")
         else:
-            nxt = "NEXT: START A NEW GAME NOW (no --restart-cmd was given). The bridge continues automatically as soon as the new game begins."
+            nxt = "NEXT: START A NEW GAME NOW (automatic restart is off). The bridge continues automatically as soon as the new game begins."
         if self.trainer is not None:
             self.trainer.announce(nxt)
         if stopping:
@@ -623,6 +709,36 @@ class Bridge:
                 subprocess.Popen(self.args.restart_cmd, shell=True)
             except OSError as e:
                 print("[train] restart command failed:", e)
+        elif game_restart:
+            # the playbook is saved: ask the game to restart the match. Two signals: a new token in bridge/restart.lua (polled by
+            # the UI hook, independent of the sim) and a restart flag in inbox.lua (polled by the sim as a backup).
+            write_inbox(self.args.inbox, self.last_sid or 0, 0, [], [], restart=True)
+            token = write_restart_token(os.path.dirname(os.path.abspath(self.args.inbox)))
+            self.restart_pending = True
+            print(f"[train] restart requested (token {token}); waiting up to {self.args.restart_timeout}s for the new match to start...")
+            threading.Timer(self.args.restart_timeout, self.restart_watchdog).start()
+
+    def restart_watchdog(self):
+        """Called some seconds after a restart request: if no new match has started, say exactly what to check."""
+        if not self.restart_pending:
+            return
+        print("\n" + "=" * 78)
+        print(" THE MATCH DID NOT RESTART within %ds. The playbook IS saved - nothing is lost." % self.args.restart_timeout)
+        print(" Look at the [game] lines above / the game log:")
+        print("   - 'LLMC|I|UI restart watcher started'   missing -> the UI hook (hook/lua/UserSync.lua) is not loaded in your LOUD;")
+        print("                                                     is the mod enabled, and does LOUD's /lua/UserSync.lua have an OnSync()?")
+        print("   - 'LLMC|I|Restart requested ... calling RestartSession()' present but no restart -> RestartSession() ran and did nothing;")
+        print("   - 'LLMC|I|ERR RestartSession() failed: ...'  -> the error text says why (e.g. the function does not exist in that state);")
+        print("   - none of the above after the episode ended -> the UI watcher cannot read bridge/restart.lua (file access).")
+        print(" For now start a new match yourself (the bridge continues automatically), or use --restart-cmd / --restart-fallback-cmd.")
+        print("=" * 78 + "\n")
+        if self.args.restart_fallback_cmd:
+            print("[train] running the fallback restart command:", self.args.restart_fallback_cmd)
+            try:
+                subprocess.Popen(self.args.restart_fallback_cmd, shell=True)
+            except OSError as e:
+                print("[train] fallback restart command failed:", e)
+        self.restart_pending = False
 
     def worker(self):
         while True:
@@ -718,12 +834,19 @@ def main():
     p.add_argument("--no-json-mode", action="store_true", help="do not send response_format=json_object")
     p.add_argument("--extra-system", help="text file appended to the system prompt (e.g. '/no_think' or personality)")
     p.add_argument("--from-start", action="store_true", help="read the log from its beginning instead of its end")
+    p.add_argument("--mode", choices=[m[0] for m in menu.MODES], default=None, help="skip the menu and run this mode (the choice is written to bridge/mode.lua for the game)")
+    p.add_argument("--no-menu", action="store_true", help="do not show the start-up menu; leave the game on its configured mode")
+    p.add_argument("--menu", action="store_true", help="show the menu even when stdin is not a terminal")
     p.add_argument("--train-dir", default=os.path.join(here, "train"), help="TRAIN mode: where episode logs, lessons.json, stats.csv and dataset.jsonl go")
     p.add_argument("--temp-start", type=float, default=0.9, help="TRAIN: sampling temperature in the first episode (exploration)")
     p.add_argument("--temp-end", type=float, default=0.3, help="TRAIN: temperature after --temp-episodes episodes (exploitation)")
     p.add_argument("--temp-episodes", type=int, default=30)
     p.add_argument("--gamma", type=float, default=0.97, help="TRAIN: discount for the logged return-to-go")
     p.add_argument("--restart-cmd", default="", help="TRAIN: shell command that restarts the match after an episode (see README)")
+    p.add_argument("--reset-lessons", action="store_true", help="TRAIN: delete the saved playbook (lessons.json, best.json) before starting; episode logs and stats are kept")
+    p.add_argument("--restart-timeout", type=int, default=90, help="TRAIN: seconds to wait for the match to restart before explaining what to check")
+    p.add_argument("--restart-fallback-cmd", default="", help="TRAIN: command to run if the automatic in-game restart did not happen within --restart-timeout")
+    p.add_argument("--no-game-restart", action="store_true", help="TRAIN: do not let the mod restart the match with RestartSession() after an episode")
     p.add_argument("--max-episodes", type=int, default=0, help="TRAIN: stop after this many episodes (0 = never)")
     p.add_argument("--selftest-mode", choices=["micro", "sacu", "army", "train", "full"], default="micro", help="which game mode the --selftest sample state is for")
     p.add_argument("--selftest", action="store_true", help="query the LLM once with a sample state and exit")
@@ -732,6 +855,13 @@ def main():
     if args.selftest:
         selftest(args)
     else:
+        interactive = args.menu or (sys.stdin.isatty() and args.mode is None and not args.no_menu)
+        if interactive and not menu.run_menu(args, here):
+            print("bye")
+            return
+        if args.mode:
+            path = menu.write_mode(os.path.dirname(os.path.abspath(args.inbox)), args.mode)
+            menu.after_selection_notice(args.mode, path)
         bridge = None
         try:
             bridge = Bridge(args)

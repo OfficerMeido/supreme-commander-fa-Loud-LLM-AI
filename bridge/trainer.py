@@ -49,6 +49,9 @@ REFLECT_SYSTEM = """You are the learning module of an agent that plays Supreme C
 After every episode you get the result, the reward breakdown and a timeline of what the agent did. Your job is to improve the agent's PLAYBOOK for the next episode.
 Rules:
 - The goal is to WIN: destroy the enemy army as fast as possible. Games last 20-30 minutes (short) up to 1-3 hours (long) and the opponent gets tougher the longer the game runs, so EARLY wins are worth the most (a speed bonus up to +300 on top of +500); a long game is a warning sign - write rules about what to do earlier. A win is worth +500 and a loss -500; economy points are scaled down and capped, so they only matter as a means to a stronger army. Reward earned by exploiting the reward function without actually playing to win (for example spamming the cheapest units, or stalling) must be called out as a mistake, with a rule to avoid it. When the agent lost or timed out, work out WHY (too passive, attacked too early/late, lost its commander, weak economy) and write rules that fix that.
+- The economy rewards follow how the game's economy works: income wins games (mass income, power keeping up with demand, upgrading extractors), running out of a resource halts construction, and MASS that overflows storage is wasted (power overflow is normal and not penalised). Good economic play = high income, no stalls, no mass overflow, resources spent as they arrive.
+- Combat units pay more the higher the production RATE (units finished per minute), defence structures pay up to a cap, and builders/factories/units take NEW orders only when idle (orders to busy ones are refused) - reward patient, varied play and a steady army build-up over repeated orders.
+- Read payload.diagnostics first: they point out one-sided or broken behaviour (for example only building factories, never building power). Turn each observation into a concrete rule that fixes it.
 - Keep rules that appear to have helped, REMOVE or rewrite rules that correlate with worse returns, add what the timeline suggests (build orders, timings, when to attack, what to avoid).
 - Be concrete and short: imperative sentences with numbers/timings (game seconds) where possible.
 - Propose ONE experiment for the next episode (a deliberate change to learn from).
@@ -65,6 +68,11 @@ class Trainer:
         os.makedirs(os.path.join(self.dir, "prompts"), exist_ok=True)
         self.lessons_path = os.path.join(self.dir, "lessons.json")
         self.best_path = os.path.join(self.dir, "best.json")
+        if getattr(args, "reset_lessons", False):
+            for fp in (self.lessons_path, self.best_path):
+                if os.path.exists(fp):
+                    os.replace(fp, fp + ".old")
+                    print("[train] --reset-lessons: moved %s to %s.old" % (os.path.basename(fp), os.path.basename(fp)))
         self.stats_path = os.path.join(self.dir, "stats.csv")
         self.dataset_path = os.path.join(self.dir, "dataset.jsonl")
         self.lessons = _load(self.lessons_path, {"lessons": [], "avoid": [], "next_experiment": "", "analysis": "", "after_episode": 0})
@@ -175,15 +183,27 @@ class Trainer:
                     "step_reward": x.get("reward_after"), "return_to_go": x["return_to_go"], "ep_return": total, "result": result,
                 }, ensure_ascii=False) + "\n")
         counts = summary.get("counts", {})
+        cols = ["episode", "result", "total", "game_seconds", "steps", "kills", "t4_kills", "units_built", "t4_built", "combat_units",
+                "defenses_built", "units_lost", "buildings_lost", "mex_lost", "when"]
+        row = {"episode": self.episode, "result": result, "total": total, "game_seconds": summary.get("time"), "steps": len(s),
+               "kills": counts.get("kill", 0) + counts.get("kill_artillery", 0) + counts.get("kill_nuke", 0) + counts.get("kill_t4", 0),
+               "t4_kills": counts.get("kill_t4", 0), "units_built": counts.get("built_unit", 0), "t4_built": counts.get("built_t4", 0),
+               "combat_units": counts.get("combat_unit", 0), "defenses_built": counts.get("defense_built", 0),
+               "units_lost": counts.get("lost_unit", 0), "buildings_lost": counts.get("lost_building", 0), "mex_lost": counts.get("lost_mex", 0),
+               "when": time.strftime("%Y-%m-%d %H:%M:%S")}
         new_file = not os.path.exists(self.stats_path)
+        header = cols
+        if not new_file:                      # an older stats.csv keeps its columns; newer ones add combat_units / defenses_built
+            try:
+                with open(self.stats_path, newline="", encoding="utf-8") as hf:
+                    header = next(csv.reader(hf), cols)
+            except OSError:
+                header = cols
         with open(self.stats_path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if new_file:
-                w.writerow(["episode", "result", "total", "game_seconds", "steps", "kills", "t4_kills", "units_built", "t4_built", "units_lost", "buildings_lost", "mex_lost", "when"])
-            w.writerow([self.episode, result, total, summary.get("time"), len(s),
-                        counts.get("kill", 0) + counts.get("kill_artillery", 0) + counts.get("kill_nuke", 0) + counts.get("kill_t4", 0),
-                        counts.get("kill_t4", 0), counts.get("built_unit", 0), counts.get("built_t4", 0),
-                        counts.get("lost_unit", 0), counts.get("lost_building", 0), counts.get("lost_mex", 0), time.strftime("%Y-%m-%d %H:%M:%S")])
+                w.writerow(cols)
+            w.writerow([row.get(c, "") for c in header])
         self.last = {"episode": self.episode, "result": result, "total": total, "time": summary.get("time"), "steps": len(s)}
         print("[train] === episode %d over: %s, return %g after %ss, %d steps ===" % (self.episode, result, total, summary.get("time"), len(s)))
         print("[train] reward breakdown:", json.dumps(summary.get("parts", {})))
@@ -276,11 +296,73 @@ class Trainer:
             text = json.dumps(payload, separators=(",", ":"))
         return text
 
+    def _diagnostics(self, summary):
+        """Plain observations about behaviour that the reward numbers alone do not show."""
+        kinds, total = {}, 0
+        for x in self.steps:
+            for a in x.get("actions") or []:
+                if a.get("a") == "build":
+                    k = str(a.get("what") or a.get("unit_id") or "?")
+                    n = a.get("n") if isinstance(a.get("n"), (int, float)) else 1
+                    kinds[k] = kinds.get(k, 0) + n
+                    total += n
+        parts = summary.get("parts", {})
+        msgs = []
+        if total >= 6:
+            top = max(kinds, key=kinds.get)
+            if kinds[top] / float(total) > 0.5:
+                msgs.append("%d of %d build orders (%d%%) were '%s' - far too one-sided; spread orders over mex, power, engineers, factories." % (
+                    kinds[top], total, 100 * kinds[top] // total, top))
+        if kinds.get("pgen", 0) + kinds.get("hydro", 0) > max(6, 2 * kinds.get("mex", 0)):
+            msgs.append("You ordered %d power generators but only %d mass extractors - far too much power; once power is sufficient build mex, factories, combat units and defences instead." % (
+                kinds.get("pgen", 0) + kinds.get("hydro", 0), kinds.get("mex", 0)))
+        if "no_combat" in parts:
+            msgs.append("You were PUNISHED %g for going without combat units (no unit finished for 90+ seconds, after minute 4): start unit production early and keep every factory producing." % parts["no_combat"])
+        if kinds.get("pgen", 0) + kinds.get("hydro", 0) == 0 and total > 0:
+            msgs.append("NO power generator was ever ordered.")
+        low = sum(1 for k in ("power_zero", "power_low") if k in parts)
+        if low:
+            msgs.append("Power storage was empty/low (rewards %s): the plan did not build enough power." % json.dumps({k: parts[k] for k in ("power_zero", "power_low") if k in parts}))
+        if "mass_zero" in parts:
+            msgs.append("Mass hit zero (%g reward): too few mass extractors or overspending." % parts["mass_zero"])
+        if "mass_waste" in parts:
+            msgs.append("Mass overflowed storage and was WASTED (%g reward): spend it (more factories/engineers/upgrades) or add mass storage. (Power overflow is normal and not penalised.)" % parts["mass_waste"])
+        if "mex_upgrade" not in parts and (summary.get("time") or 0) > 600:
+            msgs.append("No mass extractor was ever upgraded - an upgrade triples an extractor's mass income and pays +10 (T2) / +20 (T3).")
+        inc = parts.get("mass_income")
+        if inc is not None:
+            msgs.append("Mass-income reward collected: %g (higher = a bigger mass economy sooner)." % inc)
+        counts = summary.get("counts", {})
+        if counts.get("combat_unit", 0) == 0 and (summary.get("time") or 0) > 600:
+            msgs.append("NO combat units were built - production pays (+2 each, more at a high build rate) and you need an army to win.")
+        elif counts.get("combat_unit", 0):
+            msgs.append("Combat units built: %d, combat-unit reward %g (average %.1f per unit; higher = faster production rate - keep factories busy, queue batches)." % (
+                counts["combat_unit"], parts.get("combat_unit", 0), parts.get("combat_unit", 0) / float(counts["combat_unit"])))
+        if "defense_built" not in parts and ("lost_building" in parts or "lost_mex" in parts):
+            msgs.append("Buildings were lost but no defence structure was ever built (defence pays +3 x tier).")
+        # repeated identical orders in consecutive turns: the sign of an agent that does not wait for its orders to finish
+        streak = best_streak = 1
+        prev = None
+        for x in self.steps:
+            cur = json.dumps(x.get("actions"), sort_keys=True)
+            if cur == prev and x.get("actions"):
+                streak += 1
+                best_streak = max(best_streak, streak)
+            else:
+                streak = 1
+            prev = cur
+        if best_streak >= 3:
+            msgs.append("The SAME orders were repeated in %d consecutive turns. Builders, factories and units only take new orders when idle: give an order once, then wait for it to finish and order something else." % best_streak)
+        if kinds.get("mex", 0) < 4 and total > 0:
+            msgs.append("Only %d mass extractors were ordered in the whole episode." % kinds.get("mex", 0))
+        return {"build_orders_by_kind": kinds, "observations": msgs}
+
     def _reflect(self, llm, summary, total, result):
         payload = {
             "episode": self.episode, "result": result, "return": total, "game_seconds": summary.get("time"),
             "reward_totals": summary.get("parts", {}), "reward_event_counts": summary.get("counts", {}),
             "previous_returns": self.returns[-6:], "best_return": max(self.returns + [total]),
+            "diagnostics": self._diagnostics(summary),
             "timeline": self._timeline(),
             "current_playbook": {k: self.lessons.get(k) for k in ("lessons", "avoid", "next_experiment")},
         }
