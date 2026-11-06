@@ -18,6 +18,10 @@ end
 -- Build spots reserved this/last minute so two engineers are not sent to the same tile.
 Reservations = {}
 
+-- Builds ordered but possibly not started yet: { kind, x, z, t }. Used in train mode to stop the agent from ordering the
+-- same thing again and again while the first one is still queued behind other jobs.
+Pending = {}
+
 local function Num(v, def, lo, hi)
     v = tonumber(v)
     if not v then return def end
@@ -80,7 +84,9 @@ end
 local function Ranked(ctx, x, z, idleOnly, noACU)
     local out = {}
     for _, e in ipairs(Engineers(ctx)) do
-      if not (noACU and e.acu) and not (idleOnly and ((not e.unit:IsIdleState()) or ctx.load[e.unit])) then
+      if not (noACU and e.acu) and not (idleOnly and ((not e.unit:IsIdleState()) or ctx.load[e.unit]))
+         and not (ctx.wait and ((not ctx.idle0[e.unit]) or (ctx.load[e.unit] or 0) >= (ctx.cfg.TrainMaxJobsPerTurn or 3)))
+         and not (ctx.cfg.FreeRules and QueueLen(e.unit) >= (ctx.cfg.TrainMaxQueue or 4)) then
         local p = e.unit:GetPosition()
         local score = Dist(p[1], p[3], x, z)
         if not e.unit:IsIdleState() then score = score + 150 + 25 * QueueLen(e.unit) end
@@ -183,6 +189,40 @@ local Handlers = {}
 -- Structure kinds that may always be built (mass / power economy and storage).
 local FreeKinds = { mex = true, hydro = true, pgen = true, fabricator = true, mass_storage = true, energy_storage = true }
 
+-- Number of structures of `kind` that are under construction or ordered-but-not-started.
+local function PendingCount(ctx, kind)
+    local now = GetGameTimeSeconds()
+    local own, unfinished = {}, 0
+    for _, u in ipairs(ctx.brain:GetListOfUnits(categories.ALLUNITS, false)) do
+        if not u.Dead then
+            local bpid = u:GetUnitId()
+            if K.CatSet(bpid).STRUCTURE and K.StructureKind(bpid) == kind then
+                table.insert(own, u:GetPosition())
+                if u:GetFractionComplete() < 1 then unfinished = unfinished + 1 end
+            end
+        end
+    end
+    local keep, queued = {}, 0
+    for _, e in ipairs(Pending) do
+        if now - e.t < 300 then
+            if e.kind ~= kind then
+                table.insert(keep, e)
+            else
+                local started = false
+                for _, p in ipairs(own) do
+                    if math.abs(p[1] - e.x) < 5 and math.abs(p[3] - e.z) < 5 then started = true end
+                end
+                if not started then
+                    table.insert(keep, e)
+                    queued = queued + 1
+                end
+            end
+        end
+    end
+    Pending = keep
+    return unfinished + queued
+end
+
 function Handlers.build(ctx, a)
     local cands, kind
     if a.unit_id then
@@ -216,6 +256,30 @@ function Handlers.build(ctx, a)
 
     local n = Num(a.n, 1, 1, 12)
 
+    -- TRAIN MODE: do not stack up orders for the same kind while earlier ones are still under construction / queued
+    if ctx.cfg.FreeRules then
+        local caps = ctx.cfg.TrainMaxPending or {}
+        local cap = caps[skind] or caps.default or 3
+        local pend = PendingCount(ctx, skind)
+        if pend >= cap then
+            return Say(ctx, string.format('build %s skipped: %d already under construction or queued (limit %d). Build something else (power? mass extractors?) or wait for it to finish.', kind, pend, cap))
+        end
+        n = math.min(n, cap - pend)
+
+        -- POWER SUFFICIENT: more generators are pointless while storage is nearly full and income already covers demand
+        if (skind == 'pgen' or skind == 'hydro') and ctx.cfg.TrainPowerSufficient ~= false then
+            local er, eInc, eDem = 0, 0, 1
+            pcall(function()
+                er = ctx.brain:GetEconomyStoredRatio('ENERGY')
+                eInc = ctx.brain:GetEconomyIncome('ENERGY') * 10
+                eDem = ctx.brain:GetEconomyRequested('ENERGY') * 10
+            end)
+            if er >= (ctx.cfg.TrainPowerFull or 0.8) and eInc >= eDem * (ctx.cfg.TrainPowerSurplus or 1.0) then
+                return Say(ctx, string.format('build %s skipped: power is already sufficient (storage %d%%, income %d/s >= demand %d/s). Build something else: mass extractors, factories, combat units, defences.', kind, er * 100, eInc, eDem))
+            end
+        end
+    end
+
     local tech = Num(a.tech, 4, 1, 4)
     local cx, cz = ParseNear(ctx, a.near)
     local isMarker = (kind == 'mex' or kind == 'hydro')
@@ -232,6 +296,7 @@ function Handlers.build(ctx, a)
                 local x, z = FindSpot(ctx, bpid, cx, cz, radius, markers)
                 if x then
                     IssueBuildMobile({ e.unit }, Vec(x, z), bpid, {})
+                    table.insert(Pending, { kind = skind, x = x, z = z, t = GetGameTimeSeconds() })
                     ctx.load[e.unit] = (ctx.load[e.unit] or 0) + 1
                     placed = placed + 1
                     did = true
@@ -244,7 +309,7 @@ function Handlers.build(ctx, a)
         if not did then break end
     end
     Say(ctx, string.format('build %s x%d: %d queued%s', kind, n, placed,
-        placed < n and ' (no builder/tech/free spot for the rest)' or ''))
+        placed < n and (ctx.wait and ' (no IDLE builder for the rest: engineers and the ACU take new orders only after finishing the previous ones - wait for state.engineers.idle_ids / state.acu.idle; or no tech/spot)' or ' (no free builder / tech / spot for the rest; builders with 4+ queued jobs are skipped)') or ''))
 end
 
 local function Factories(ctx, which)
@@ -292,19 +357,23 @@ function Handlers.produce(ctx, a)
     local tech = Num(a.tech, 4, 1, 4)
     local capable = {}
     for _, f in ipairs(Factories(ctx, a.factory)) do
-        if QueueLen(f) < 20 then
+        if (ctx.wait and ctx.idle0[f] and (ctx.facUsed[f] or 0) < (ctx.cfg.TrainMaxProduceOrders or 3)) or ((not ctx.wait) and QueueLen(f) < 20) then
             local bpid = K.BestBuildable(f, cands, tech)
             if bpid then table.insert(capable, { unit = f, bp = bpid }) end
         end
     end
     local cnt = table.getn(capable)
-    if cnt == 0 then return Say(ctx, 'produce ' .. kind .. ': no suitable factory (wrong type, wrong tech, busy or upgrading)') end
+    if cnt == 0 then
+        if ctx.wait then return Say(ctx, 'produce ' .. kind .. ': no idle suitable factory - a factory takes a new order only when its queue is EMPTY (wait for factories[].idle = true), or wrong type/tech/upgrading') end
+        return Say(ctx, 'produce ' .. kind .. ': no suitable factory (wrong type, wrong tech, busy or upgrading)')
+    end
     local left, queued = n, 0
     for i, c in ipairs(capable) do
         local share = math.ceil(left / (cnt - i + 1))
         if share > 0 then
             if a.clear then IssueClearCommands({ c.unit }) end
             IssueBuildFactory({ c.unit }, c.bp, share)
+            ctx.facUsed[c.unit] = (ctx.facUsed[c.unit] or 0) + 1
             queued = queued + share
             left = left - share
         end
@@ -375,7 +444,8 @@ function Handlers.upgrade(ctx, a)
         local cur = K.TechOf(bpid)
         local up = u:GetBlueprint().General and u:GetBlueprint().General.UpgradesTo
         if up and up ~= '' and (not from or cur == from) and (not maxT or cur < maxT)
-           and not u:IsUnitState('Upgrading') and u:CanBuild(up) and GateOK(bpid) then
+           and not u:IsUnitState('Upgrading') and u:CanBuild(up) and GateOK(bpid)
+           and ((not ctx.wait) or K.CatSet(bpid).MASSEXTRACTION or ctx.idle0[u]) then
             -- factories are almost always busy building units: drop the queue so the upgrade can start
             if not K.CatSet(bpid).MASSEXTRACTION and not u:IsIdleState() then IssueClearCommands({ u }) end
             IssueUpgrade({ u }, up)
@@ -482,6 +552,18 @@ local function SquadOrder(ctx, a, mode)
     if not recipe then return Say(ctx, mode .. ': unknown squad ' .. tostring(name)) end
     local units = K.Select(ctx.all, recipe)
     if table.getn(units) == 0 then return Say(ctx, mode .. ' ' .. name .. ': no such units') end
+    local skipped = 0
+    if ctx.wait and ctx.cfg.TrainWaitSquads ~= false and mode ~= 'retreat' and mode ~= 'stop' then
+        local ready = {}
+        for _, u in ipairs(units) do
+            if ctx.idle0[u] then table.insert(ready, u) end
+        end
+        skipped = table.getn(units) - table.getn(ready)
+        units = ready
+        if table.getn(units) == 0 then
+            return Say(ctx, mode .. ' ' .. name .. ': all ' .. skipped .. ' units are still busy with earlier orders - units take new orders only when idle (retreat and stop always work)')
+        end
+    end
 
     local points = {}
     if mode == 'retreat' then
@@ -522,7 +604,7 @@ local function SquadOrder(ctx, a, mode)
     else
         for _, p in ipairs(points) do IssueMove(units, Vec(p[1], p[2])) end
     end
-    Say(ctx, string.format('%s %s: %d units', mode, name, table.getn(units)))
+    Say(ctx, string.format('%s %s: %d units%s', mode, name, table.getn(units), skipped > 0 and (' (' .. skipped .. ' busy units skipped)') or ''))
 end
 
 function Handlers.attack(ctx, a)  SquadOrder(ctx, a, 'attack') end
@@ -548,6 +630,34 @@ function Execute(brain, actions, cfg, trusted)
             ctx.units[tostring(u:GetEntityId())] = u
             if K.CatSet(u:GetUnitId()).COMMAND then ctx.acu = u end
         end
+    end
+
+    -- TRAIN MODE - WAIT FOR ORDERS TO FINISH: remember which builders / factories / units were idle (nothing queued) when this
+    -- turn's orders arrived. New orders go only to those: a builder, factory or unit that is still carrying out earlier orders
+    -- is left alone, so the agent cannot keep re-issuing the same order on top of a queue.
+    ctx.wait = (cfg.FreeRules and cfg.TrainWaitForOrders ~= false) and true or false
+    ctx.idle0, ctx.facUsed = {}, {}
+    if ctx.wait then
+        for _, u in ipairs(ctx.all) do
+            if not u.Dead then
+                local s = K.CatSet(u:GetUnitId())
+                if s.FACTORY then
+                    ctx.idle0[u] = (QueueLen(u) == 0)                          -- a factory is free when its queue is empty
+                elseif s.ENGINEER or s.COMMAND then
+                    ctx.idle0[u] = u:IsIdleState() and QueueLen(u) == 0
+                elseif s.MOBILE then
+                    ctx.idle0[u] = u:IsIdleState()
+                end
+            end
+        end
+        local ie, ifc, iu = 0, 0, 0
+        for u, v in pairs(ctx.idle0) do
+            if v then
+                local s = K.CatSet(u:GetUnitId())
+                if s.FACTORY then ifc = ifc + 1 elseif s.ENGINEER or s.COMMAND then ie = ie + 1 else iu = iu + 1 end
+            end
+        end
+        Say(ctx, string.format('at the start of this turn %d engineers/ACU, %d factories and %d other units were idle (only idle ones accept new orders)', ie, ifc, iu))
     end
 
     local max = cfg.MaxActionsPerTurn or 24

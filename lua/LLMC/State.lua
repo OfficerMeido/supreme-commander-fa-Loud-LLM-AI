@@ -109,6 +109,7 @@ function Build(brain, cfg, seq, sid, now, lastResults)
     ---------------------------------------------------------------- own units
     local all = brain:GetListOfUnits(categories.ALLUNITS, false)
     local structs, building = {}, 0
+    local constr, engBusy, engQueued = {}, 0, 0      -- under construction per kind; busy engineers; queued jobs
     local factories, engIdle, engTotal = {}, {}, 0
     local squads = {}
     local counts = {}
@@ -121,6 +122,10 @@ function Build(brain, cfg, seq, sid, now, lastResults)
             local s = K.CatSet(bpid)
             if u:GetFractionComplete() < 1 then
                 building = building + 1
+                if s.STRUCTURE then
+                    local ck = K.StructureKind(bpid)
+                    constr[ck] = (constr[ck] or 0) + 1
+                end
             elseif s.COMMAND then
                 acu = u
                 table.insert(builders, u)
@@ -128,7 +133,8 @@ function Build(brain, cfg, seq, sid, now, lastResults)
                 engTotal = engTotal + 1
                 table.insert(engineers, u)
                 table.insert(builders, u)
-                if u:IsIdleState() then table.insert(engIdle, tostring(u:GetEntityId())) end
+                if u:IsIdleState() then table.insert(engIdle, tostring(u:GetEntityId())) else engBusy = engBusy + 1 end
+                engQueued = engQueued + QueueLen(u)
             elseif s.STRUCTURE then
                 local kind = K.StructureKind(bpid)
                 local tk = 't' .. K.TechOf(bpid)
@@ -139,8 +145,9 @@ function Build(brain, cfg, seq, sid, now, lastResults)
                     local p = u:GetPosition()
                     local fk = 'other'
                     if kind == 'land_factory' then fk = 'land' elseif kind == 'air_factory' then fk = 'air' elseif kind == 'naval_factory' then fk = 'naval' end
+                    local fq = QueueLen(u)
                     table.insert(factories, { id = tostring(u:GetEntityId()), kind = fk, tech = K.TechOf(bpid),
-                        pos = XZ(p), idle = u:IsIdleState(), queue = QueueLen(u),
+                        pos = XZ(p), idle = (fq == 0), queue = fq,
                         upgrading = u:IsUnitState('Upgrading') and true or false })
                 elseif kind == 'mex' and u:IsUnitState('Upgrading') then
                     structs.mex_upgrading = (structs.mex_upgrading or 0) + 1
@@ -159,6 +166,7 @@ function Build(brain, cfg, seq, sid, now, lastResults)
     end
     st.structures = structs
     st.building_in_progress = building
+    st.under_construction = constr          -- e.g. {land_factory=1, pgen=2}: ordered AND started; do not order the same again
     st.factories = factories
     st.engineers = { total = engTotal, idle = table.getn(engIdle) }
     local idl = {}
@@ -186,7 +194,8 @@ function Build(brain, cfg, seq, sid, now, lastResults)
     if acu then
         local mhp = acu:GetMaxHealth()
         if mhp < 1 then mhp = 1 end
-        st.acu = { id = tostring(acu:GetEntityId()), pos = XZ(acu:GetPosition()), hp = R1(acu:GetHealth() / mhp) }
+        st.acu = { id = tostring(acu:GetEntityId()), pos = XZ(acu:GetPosition()), hp = R1(acu:GetHealth() / mhp),
+                   idle = acu:IsIdleState(), queued_jobs = QueueLen(acu) }
         -- available ACU enhancements (name + mass cost)
         pcall(function()
             local enh = acu:GetBlueprint().Enhancements
@@ -267,5 +276,68 @@ function Build(brain, cfg, seq, sid, now, lastResults)
     end
 
     st.last_results = lastResults
+
+    -- Alerts (train mode): plain-language warnings about the most common mistakes
+    if cfg.FreeRules then
+        local alerts = {}
+        local m, e = st.eco.mass, st.eco.energy
+        if e.stored_ratio and e.stored_ratio < 0.2 then
+            table.insert(alerts, 'POWER LOW (' .. math.floor(e.stored_ratio * 100) .. '% stored): build power generators (pgen) NOW - everything slows down and you lose reward')
+        end
+        if e.income and e.demand and e.income < e.demand then
+            table.insert(alerts, 'power income (' .. e.income .. '/s) is below demand (' .. e.demand .. '/s): build more pgen')
+        end
+        if e.stored_ratio and e.stored_ratio >= 0.8 and e.income and e.demand and e.income >= e.demand then
+            table.insert(alerts, 'power is SUFFICIENT (storage ' .. math.floor(e.stored_ratio * 100) .. '%, income ' .. e.income .. '/s >= demand ' .. e.demand ..
+                '/s): more power generators are refused and useless - build mass extractors, factories, COMBAT UNITS or defences instead')
+        end
+        if m.stored_ratio and m.stored_ratio < 0.02 then
+            table.insert(alerts, 'MASS EMPTY: build mass extractors (mex) on free_mass spots, stop spending on expensive things')
+        end
+        if (constr.pgen or 0) == 0 and structs.pgen == nil and structs.hydro == nil then
+            table.insert(alerts, 'you have NO power generator at all - build pgen first')
+        end
+        local fac = (constr.land_factory or 0) + (constr.air_factory or 0) + (constr.naval_factory or 0)
+        if fac > 0 then
+            table.insert(alerts, fac .. ' factory(ies) already under construction - do NOT order more factories now; build power/mass/engineers instead')
+        end
+        local aq = st.acu and st.acu.queued_jobs or 0
+        if aq >= 3 then
+            table.insert(alerts, 'the ACU already has ' .. aq .. ' queued jobs; new build orders wait behind them (builders with 4+ jobs get no more orders)')
+        end
+        -- orders are only accepted by idle builders / factories (cfg.TrainWaitForOrders)
+        local idleFac = 0
+        for _, f in ipairs(factories) do
+            if f.idle and f.queue == 0 and not f.upgrading then idleFac = idleFac + 1 end
+        end
+        local acuIdle = st.acu and st.acu.idle
+        if table.getn(engIdle) == 0 and not acuIdle then
+            table.insert(alerts, 'every engineer and the ACU is BUSY: build orders to busy builders are refused - wait until one is idle (state.engineers.idle_ids / state.acu.idle) and do not repeat orders that are already in progress')
+        end
+        if table.getn(factories) > 0 and idleFac == 0 then
+            table.insert(alerts, 'every factory still has a queue: produce orders are refused until a factory has finished its queue (factories[].idle) - queue bigger batches (n=10) when one is idle')
+        end
+        -- the two things this agent forgets: engineers, and moving its army
+        if engTotal < 4 and table.getn(factories) > 0 then
+            table.insert(alerts, 'you have only ' .. engTotal .. ' engineers: produce engineers FIRST ({"a":"produce","factory":"land","what":"engineer","n":3}) - they build your economy; you can queue combat units after them in the same turn')
+        end
+        local armyN, armyIdle = 0, 0
+        for role, q in pairs(squads) do
+            if role ~= 'scouts' then armyN = armyN + q.n armyIdle = armyIdle + q.idle end
+        end
+        if armyIdle >= 3 then
+            local tx, tz = nil, nil
+            if st.enemy_starts and st.enemy_starts[1] then tx, tz = st.enemy_starts[1].pos[1], st.enemy_starts[1].pos[2] end
+            if st.contacts and st.contacts[1] then tx, tz = st.contacts[1].pos[1], st.contacts[1].pos[2] end
+            local hint = 'gather them with {"a":"move","squad":"land","x":..,"z":..} or scout for the enemy'
+            if tx then hint = 'e.g. {"a":"attack","squad":"land","x":' .. tx .. ',"z":' .. tz .. '} (enemy near ' .. tx .. ',' .. tz .. ')' end
+            table.insert(alerts, armyIdle .. ' of your ' .. armyN .. ' combat units are IDLE (an idle army earns nothing): send them - ' .. hint)
+        end
+        if engTotal > 0 and table.getn(engIdle) > 0 then
+            table.insert(alerts, table.getn(engIdle) .. ' engineer(s) idle: give them build/assist/reclaim orders')
+        end
+        st.alerts = alerts
+        st.construction = { engineers_busy = engBusy, queued_jobs_engineers = engQueued }
+    end
     return st
 end

@@ -129,6 +129,32 @@ function Main()
                 LOG('LLMC|I|EPISODE_END|' .. result .. '|' .. math.floor(sum.total) .. '|' .. math.floor(now))
                 LOG('LLMC|I|EPISODE HAS ENDED (' .. result .. ', reward ' .. math.floor(sum.total) .. ', ' .. math.floor(now) .. ' game seconds). The bridge is saving the playbook - START A NEW GAME to continue training.')
                 Json.LogChunks('E', seq + 1, Json.Encode(sum))
+                if Cfg.AutoRestart ~= false then
+                    -- wait until the bridge has reflected on the episode and saved the playbook, THEN restart the match
+                    -- (the next match must start with the updated lessons). The bridge signals with inbox.restart = true.
+                    LOG('LLMC|I|Waiting for the bridge to save the playbook before restarting the match (up to ' .. (Cfg.RestartWaitSeconds or 900) .. ' s)...')
+                    local waited, go = 0, false
+                    while waited < (Cfg.RestartWaitSeconds or 900) do
+                        local box = ReadInbox()
+                        if box and box.sid == sid and box.restart then go = true break end
+                        if math.mod(waited, 30) == 29 then
+                            LOG('LLMC|I|still waiting for the bridge (inbox sid=' .. tostring(box and box.sid) .. ' expected ' .. tostring(sid) ..
+                                ', restart=' .. tostring(box and box.restart) .. ')')
+                        end
+                        WaitSeconds(1)
+                        waited = waited + 1
+                    end
+                    if go then
+                        LOG('LLMC|I|Playbook saved - asking the UI to restart the match with RestartSession().')
+                        -- Sync fields last only one tick, so keep asking for a while in case a tick was missed
+                        for i = 1, 20 do
+                            Sync.LLMC_Restart = true
+                            WaitSeconds(1)
+                        end
+                    else
+                        LOG('LLMC|I|WARN no restart signal from the bridge within the time limit; the match was NOT restarted. Start a new game manually.')
+                    end
+                end
                 return
             end
             if now >= nextEco then
@@ -148,6 +174,9 @@ function Main()
             local ok, results, count = pcall(exec, brain, box.actions or {}, xcfg)
             if ok then
                 lastResults = results
+                local joined = ''
+                for _, r in ipairs(results) do joined = joined .. r .. ' ; ' end
+                LOG('LLMC|I|RESULTS turn ' .. tostring(box.seq) .. ': ' .. string.sub(joined, 1, 900))
             else
                 lastResults = { 'executor error: ' .. tostring(results) }
                 WARN('LLMC executor error: ' .. tostring(results))
@@ -191,6 +220,11 @@ function Main()
                 elseif train then
                     st.mode = 'train'
                     st.reward = Reward.PopStep()
+                    local since = Reward.SecondsSinceCombat(now)
+                    if st.alerts and now >= (Cfg.NoCombatGrace or 240) and since > (Cfg.NoCombatWindow or 90) then
+                        table.insert(st.alerts, 'NO COMBAT UNITS finished for ' .. math.floor(since) .. ' s - this costs ' .. (Cfg.NoCombatPenalty or -2) ..
+                            ' reward every 10 s. Queue combat units (tank / fighter / bomber / gunship / warship) in EVERY idle factory now (n=10 batches); build a factory if you have none')
+                    end
                 else
                     st.strategy = Actions.Strategy
                     local nb = st.enemy_near_base

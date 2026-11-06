@@ -49,6 +49,8 @@ Config = {
     -- TRAIN mode
     TrainEcoInterval = 10,       -- game seconds between economy-reward evaluations (storage / power / waste rewards)
     TrainMaxSeconds = 10800,     -- an episode that lasts this long (3 hours) ends as a 'timeout'. Short games last 20-30 min, long ones 1-3 h
+    AutoRestart = true,          -- after an episode: wait for the bridge to save the playbook, then restart the match with RestartSession()
+    RestartWaitSeconds = 900,    -- how long (game seconds) to wait for the bridge before giving up on the automatic restart
     TrainEndOnAnyArmy = true,    -- true: the episode ends as soon as ANY army is destroyed; false: only when ALL enemies are
     -- Terminal rewards - these make the agent train to WIN and destroy its opponents:
     WinReward = 500,             -- the enemy army was destroyed
@@ -58,8 +60,47 @@ Config = {
     TimePenaltyCap = 250,        -- ... but never more than this in total, so even a 3-hour win beats a loss
     WinSpeedBonus = 300,         -- extra reward for winning EARLY (opponents get tougher the longer a game runs): full at 0 s,
     WinSpeedHorizon = 7200,      -- falling linearly to 0 at this many seconds (20 min win ~ +250, 1 h ~ +150, 2 h+ = 0)
+    -- Economy rewards (follow how the economy works): income wins games, stalls halt construction, overflow is wasted.
+    IncomeRewardPerMass = 0.4,   -- per mass/second of income, every TrainEcoInterval (before EcoRewardScale)
+    PowerBalancedReward = 3,     -- energy income >= energy demand
+    HealthyBufferReward = 2,     -- mass storage between 30% and 95% AND power storage above 30% (power may sit full: it is always in surplus)
+    MexUpgradeRewardT2 = 10,     -- a mass extractor finished its upgrade to tier 2 (an upgrade triples its mass)
+    MexUpgradeRewardT3 = 20,     -- ... to tier 3
     EcoRewardScale = 0.25,       -- the POSITIVE economy rewards (storage > 30%, power full, mass >= 80%) are multiplied by this ...
     EcoRewardCap = 300,          -- ... and can add at most this much per 30 minutes of play (penalties keep their full value)
+    -- Combat-unit and defence rewards (train mode)
+    CombatUnitReward = 2,        -- every combat unit finished (land/air/naval, not engineers/scouts/ACU) ...
+    CombatRateBonus = 0.5,       -- ... + this for each combat unit finished in the previous CombatRateWindow seconds: a HIGH BUILD RATE pays more
+    CombatRateCap = 10,          -- (at most this many recent units count, so a unit is worth at most 2 + 0.5 x 10 = 7)
+    CombatRateWindow = 60,
+    DefenseBuiltReward = 3,      -- defence structure finished (point defence, anti-air, torpedo, shield): this x tier (T1 3, T2 6, T3 9) ...
+    DefenseRewardCap = 150,      -- ... at most this much per 30 minutes of play
+
+    -- NO ARMY punishment (train mode): after NoCombatGrace seconds, every economy tick (TrainEcoInterval) in which no combat unit
+    -- finished during the last NoCombatWindow seconds costs NoCombatPenalty, at most NoCombatCap per 30 minutes of play.
+    NoCombatPenalty = -2,
+    NoCombatGrace = 240,
+    NoCombatWindow = 90,
+    NoCombatCap = 300,
+
+    -- Power generators are refused while power is already sufficient: energy storage >= TrainPowerFull AND income >= demand x TrainPowerSurplus.
+    TrainPowerSufficient = true,
+    TrainPowerFull = 0.8,
+    TrainPowerSurplus = 1.0,
+
+    -- WAIT FOR ORDERS TO FINISH (train mode): a builder / factory / unit takes new orders only when it was idle (nothing queued)
+    TrainWaitForOrders = true,   -- engineers, the ACU and factories (also factory upgrades, assist, reclaim)
+    TrainWaitSquads = true,      -- combat units too: attack/move/patrol/scout go only to idle units (retreat and stop always work)
+    TrainMaxProduceOrders = 3,   -- a factory may receive up to this many produce orders in ONE turn (e.g. engineers first, then tanks)
+    TrainMaxJobsPerTurn = 3,     -- an idle builder may receive up to this many jobs in ONE turn (a short queue), then must finish them
+
+    -- Train mode ordering limits (stop the agent stacking the same order again and again):
+    TrainMaxQueue = 4,           -- a builder (ACU / engineer) with this many queued jobs gets no new build orders
+    TrainMaxPending = {          -- max structures of a kind under construction or ordered-but-not-started at the same time
+        land_factory = 1, air_factory = 1, naval_factory = 1,
+        pgen = 3, hydro = 2, mex = 4, fabricator = 2, radar = 1, omni = 1, sonar = 1, shield = 1,
+        default = 3,
+    },
     RewardMode = 'max',          -- kill reward: 'max' = highest applicable (3 / T4 6 / artillery 4 / nuke 8), 'sum' = add them
 
     -- micro mode QUANTUM GATEWAY: every ACU (SACU) the Quantum Gateway builds is taken from LOUD for good and belongs to
@@ -112,3 +153,14 @@ Config = {
     -- Folder (inside the mod) that the bridge writes inbox.lua to. Must match the mod folder name.
     BridgeDir = '/mods/LLMCommander/bridge/',
 }
+
+-- The bridge's start-up menu (llm_bridge.py) writes bridge/mode.lua; if present it overrides Takeover for this match.
+pcall(function()
+    local env = {}
+    doscript(Config.BridgeDir .. 'mode.lua', env)
+    local m = env.LLMC_MODE
+    if type(m) == 'table' and type(m.Takeover) == 'string' then
+        local ok = { micro = true, sacu = true, army = true, replace = true, overlay = true, train = true }
+        if ok[m.Takeover] then Config.Takeover = m.Takeover end
+    end
+end)

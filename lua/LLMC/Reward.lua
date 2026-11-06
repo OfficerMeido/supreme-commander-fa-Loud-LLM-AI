@@ -2,8 +2,8 @@
 -- Event rewards come from the Unit hook (hook/lua/sim/Unit.lua); economy rewards from EcoTick (called by the controller).
 --   destroy enemy unit +3 | enemy Tech 4 +6 | killed by an artillery installation +4 | killed by a nuke +8
 --   produce unit +2 | produce Tech 4 unit +8
---   mass AND power storage above 30% +2 | power storage full +3 | mass storage >= 80% +4
---   mass wasted -6 | power under 20% -2 | power at 0 -4 | mass at 0 -4
+--   ECONOMY (follows the wiki): mass income +0.4 per M/s | power supply >= demand +3 | storage buffer 30-95% +2 | mex upgraded to T2 +10, T3 +20
+--   stalls: mass at 0 -4 | power at 0 -4 | power under 20% -2;  waste: mass overflow -6 (power overflow is normal and NOT penalised)
 --   WIN +500 (+ up to +300 speed bonus, none after 2 h) | LOSS -500 | TIMEOUT -250 | time -5/min (at most -250 in total)
 --   the positive economy rewards are x0.25 and capped at 300 per 30 minutes of play
 --   lose a unit -1 | lose a building -3 | lose a mass extractor -4
@@ -19,6 +19,10 @@ StepSum = 0
 EcoPos = 0                -- positive economy reward collected so far this episode
 WinR, LossR, TimeoutR, EcoScale, EcoCap, TimeRate, TickLen = 500, -500, -250, 0.25, 300, 5, 10
 TimeCap, TimePaid, SpeedBonus, SpeedHorizon, CapNow = 250, 0, 300, 7200, 300
+IncomeMass, PowerBalancedR, BufferR, MexT2R, MexT3R = 0.4, 3, 2, 10, 20
+CombatR, CombatRate, CombatCap, CombatWindow, DefR, DefCap, DefPaid = 2, 0.5, 10, 60, 3, 150, 0
+CombatTimes = {}          -- game times at which our recent combat units finished (for the production-RATE bonus)
+NoCombatPenalty, NoCombatGrace, NoCombatWindow, NoCombatCap, NoCombatPaid, LastCombat = -2, 240, 90, 300, 0, -1
 Totals = {}               -- reward name -> total this episode
 Counts = {}               -- reward name -> how many times this episode
 StepParts = {}            -- reward name -> total since the last observation
@@ -34,9 +38,22 @@ function Reset(idx, cfg)
     TimeRate, TickLen = cfg.TimePenaltyPerMinute or 5, cfg.TrainEcoInterval or 10
     TimeCap, SpeedBonus, SpeedHorizon = cfg.TimePenaltyCap or 250, cfg.WinSpeedBonus or 300, cfg.WinSpeedHorizon or 7200
     CapNow = EcoCap
+    IncomeMass, PowerBalancedR, BufferR = cfg.IncomeRewardPerMass or 0.4, cfg.PowerBalancedReward or 3, cfg.HealthyBufferReward or 2
+    MexT2R, MexT3R = cfg.MexUpgradeRewardT2 or 10, cfg.MexUpgradeRewardT3 or 20
+    CombatR, CombatRate, CombatCap, CombatWindow = cfg.CombatUnitReward or 2, cfg.CombatRateBonus or 0.5, cfg.CombatRateCap or 10, cfg.CombatRateWindow or 60
+    DefR, DefCap, DefPaid = cfg.DefenseBuiltReward or 3, cfg.DefenseRewardCap or 150, 0
+    CombatTimes = {}
+    NoCombatPenalty, NoCombatGrace, NoCombatWindow, NoCombatCap = cfg.NoCombatPenalty or -2, cfg.NoCombatGrace or 240, cfg.NoCombatWindow or 90, cfg.NoCombatCap or 300
+    NoCombatPaid, LastCombat = 0, -1
 end
 
 function Stop() Active = false end
+
+-- seconds since the last combat unit finished (or since the start if none yet)
+function SecondsSinceCombat(now)
+    if LastCombat < 0 then return now or 0 end
+    return (now or 0) - LastCombat
+end
 
 local function Add(name, v)
     if not Active then return end
@@ -52,7 +69,8 @@ local function EcoCapNow() return CapNow end
 
 function PopStep()
     local r = { step = StepSum, parts = StepParts, episode_total = EpTotal,
-                rules = { win = WinR, loss = LossR, timeout = TimeoutR, economy_scale = EcoScale, economy_cap = EcoCapNow(), time_per_minute = -TimeRate, time_penalty_cap = -TimeCap,
+                rules = { win = WinR, loss = LossR, timeout = TimeoutR, economy_scale = EcoScale, economy_cap = EcoCapNow(),
+                          no_combat_penalty = NoCombatPenalty, no_combat_after_s = NoCombatGrace, combat_unit_base = CombatR, combat_rate_bonus_per_recent_unit = CombatRate, combat_rate_window_s = CombatWindow, defense_per_tier = DefR, mass_income_per_mass_per_s = IncomeMass * EcoScale, time_per_minute = -TimeRate, time_penalty_cap = -TimeCap,
                           win_speed_bonus = SpeedBonus, win_speed_horizon = SpeedHorizon } }
     StepSum = 0
     StepParts = {}
@@ -102,9 +120,48 @@ end
 function OnBuilt(unit)
     if not Active then return end
     if unit:GetArmy() ~= OurIdx then return end
-    local s = K.CatSet(unit:GetUnitId())
+    local bpid = unit:GetUnitId()
+    local s = K.CatSet(bpid)
+    if s.STRUCTURE then
+        -- a mass extractor that finished at tier 2/3 is an UPGRADE (engineers cannot build T2/T3 mex directly): it multiplies the mass income
+        if s.MASSEXTRACTION then
+            local t = K.TechOf(unit:GetUnitId())
+            if t == 2 then Add('mex_upgrade', MexT2R) elseif t >= 3 then Add('mex_upgrade', MexT3R) end
+        end
+        -- DEFENCE STRUCTURES (point defence, anti-air, torpedo, shield): DefenseBuiltReward x tier (T1 3, T2 6, T3 9),
+        -- at most DefenseRewardCap per 30 minutes of play so defence spam cannot become the point of the game
+        local kind = K.StructureKind(bpid)
+        if kind == 'pd' or kind == 'aa' or kind == 'torpedo' or kind == 'shield' then
+            local now = GetGameTimeSeconds()
+            local v = DefR * math.min(3, K.TechOf(bpid))
+            local room = DefCap * (1 + math.floor(now / 1800)) - DefPaid
+            if v > room then v = room end
+            if v > 0 then
+                DefPaid = DefPaid + v
+                Add('defense_built', v)
+            end
+        end
+        return
+    end
     if (not s.MOBILE) or s.COMMAND then return end
     if s.EXPERIMENTAL then Add('built_t4', 8) else Add('built_unit', 2) end
+
+    -- COMBAT UNITS: an extra reward that grows with the production RATE - every combat unit finished is worth
+    -- CombatUnitReward + CombatRateBonus x (combat units finished in the previous CombatRateWindow seconds, max CombatRateCap).
+    -- Trickling units out pays little; keeping several factories busy pays a lot.
+    local role = K.MobileRole(bpid)
+    if role == 'land' or role == 'fighters' or role == 'bombers' or role == 'gunships' or role == 'naval' or role == 'air' then
+        local now = GetGameTimeSeconds()
+        LastCombat = now
+        local fresh = {}
+        for _, t in ipairs(CombatTimes) do
+            if now - t <= CombatWindow then table.insert(fresh, t) end
+        end
+        local recent = table.getn(fresh)
+        table.insert(fresh, now)
+        CombatTimes = fresh
+        Add('combat_unit', CombatR + CombatRate * math.min(recent, CombatCap))
+    end
 end
 
 -- A positive economy reward, scaled by EcoRewardScale and limited by EcoRewardCap per episode (so economy points
@@ -118,26 +175,44 @@ local function AddEco(name, v)
     Add(name, v)
 end
 
--- economy shaping, evaluated every Config.TrainEcoInterval game seconds
+-- Economy rewards, evaluated every Config.TrainEcoInterval game seconds. They follow how the economy works (supcom wiki):
+--   * income is what wins games ("time is everything"): reward mass income, and upgrading extractors (an upgrade triples a mex)
+--   * running out of a resource halts construction (an energy shortage also switches off radar and shields): penalties
+--   * anything generated beyond storage is wasted: penalties; stockpiles are only a buffer, so a big hoard is not rewarded
 function EcoTick(brain, now)
     if not Active then return end
     CapNow = EcoCap * (1 + math.floor((now or 0) / 1800))      -- the cap grows by EcoRewardCap for every 30 minutes of play
-    local mr, er, mInc, mDem = 0.5, 0.5, 0, 0
+    local mr, er, mInc, mDem, eInc, eDem = 0.5, 0.5, 0, 0, 0, 0
     pcall(function()
         mr = brain:GetEconomyStoredRatio('MASS')
         er = brain:GetEconomyStoredRatio('ENERGY')
-        mInc = brain:GetEconomyIncome('MASS') * 10
+        mInc = brain:GetEconomyIncome('MASS') * 10          -- per second
         mDem = brain:GetEconomyRequested('MASS') * 10
+        eInc = brain:GetEconomyIncome('ENERGY') * 10
+        eDem = brain:GetEconomyRequested('ENERGY') * 10
     end)
-    -- penalties (full value)
+    -- STALLS (full value): construction halts at 0; no power also shuts down radar and shield generators
     if mr <= 0.005 then Add('mass_zero', -4) end
-    if mr >= 0.99 and mInc > mDem then Add('mass_waste', -6) end
     if er <= 0.005 then Add('power_zero', -4)
     elseif er < 0.2 then Add('power_low', -2) end
-    -- positive economy rewards (scaled and capped)
-    if mr >= 0.8 then AddEco('mass_high', 4) end
-    if er >= 0.99 then AddEco('power_full', 3) end
-    if mr > 0.3 and er > 0.3 then AddEco('storage_ok', 2) end
+    -- WASTE (full value): mass that does not fit into storage is lost. Power overflow is normal (power income is far larger
+    -- than mass income: +1000 energy against +1 mass is fine) and is NOT penalised.
+    if mr >= 0.99 and mInc > mDem then Add('mass_waste', -6) end
+    -- POSITIVE (scaled and capped): income wins games
+    if mInc > 0 then AddEco('mass_income', IncomeMass * mInc) end
+    if er > 0.05 and eInc >= eDem then AddEco('power_balanced', PowerBalancedR) end          -- supply meets demand
+    if mr > 0.3 and er > 0.3 and mr < 0.95 then AddEco('storage_ok', BufferR) end     -- a buffer: mass in stock but not overflowing; power may sit full
+    -- NO ARMY: after the grace period, every economy tick in which no combat unit finished during the last NoCombatWindow
+    -- seconds is punished (at most NoCombatCap per 30 minutes of play). You cannot win without an army.
+    if (now or 0) >= NoCombatGrace and SecondsSinceCombat(now) > NoCombatWindow then
+        local cost = -NoCombatPenalty
+        local room = NoCombatCap * (1 + math.floor((now or 0) / 1800)) - NoCombatPaid
+        if cost > room then cost = room end
+        if cost > 0 then
+            NoCombatPaid = NoCombatPaid + cost
+            Add('no_combat', -cost)
+        end
+    end
     -- time pressure: a faster win is better than a slow one
     if TimeRate > 0 and TimePaid < TimeCap then
         local v = TimeRate * TickLen / 60
