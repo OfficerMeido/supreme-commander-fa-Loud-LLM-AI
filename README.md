@@ -51,7 +51,7 @@ bridge warns you. Skip the menu with `--mode train` (still writes `mode.lua`) or
 
 # What i am planning to vibe code
 - UI improvements
-- Bugs 
+- Fix Bugs 
 
 # Change Log
 - 04/11/2026 Added train mode - idk how well it works yet
