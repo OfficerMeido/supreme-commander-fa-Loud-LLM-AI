@@ -24,34 +24,39 @@ In `replace` mode look for `LLMC|I|INFO built-in AI disabled for ARMY_n` in the 
 
 | Model | Notes |Get it Here|
 |-------|-------|-----------|
-| **Qwen3.8-9B-Distill-GGUF** | Any of the GGUF variants work fine. Turn reasoning off with `-rea off` |[Qwen3.8-9B-Distill-GGUF](https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/tree/main)
-
+| **Qwen3.8-9B-Distill-GGUF** | Any of the GGUF variants work fine. limit reasoning to 512 `--reasoning-budget 512` |[Qwen3.8-9B-Distill-GGUF](https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/tree/main)
+|**Hermes-3-Llama-3.1-8B-GGUF**| Any of the GGUF variants work fine.|https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B-GGUF/tree/main|
 ---
 
+## Using a small local model (e.g. Hermes-3-Llama-3.1-8B Q4_K_M)
+An 8B model can follow the JSON format but loses track of a long game state, so use it where the mod does the heavy lifting. Suggestions:
+- **Server:** `llama-server -m Hermes-3-Llama-3.1-8B.Q4_K_M.gguf -c 16384 -ngl 99 --jinja --port 8080` (Hermes-3 uses the ChatML template that is stored in the GGUF; `--jinja` applies it;
+  16k context is plenty, the prompts are 3-6k tokens). Bridge: `--temperature 0.3 --max-tokens 1500` (lower temperature = steadier JSON). If the server rejects JSON mode add `--no-json-mode`.
+- **Pick the right mode.** `replace` (full game + macro manager) works best: the macro builds the routine and the LLM only steers. `army` and the gateway modes need less from the model. `train` is
+  the hardest for an 8B model - expect many early episodes to go badly.
+- **"It forgets about mass" (replace mode):** the macro only added mass extractors with *idle* engineers, and a small model keeps every engineer busy with its own orders, so mass was never served.
+  Now (1) when stored mass is low (`MacroMassPriorityRatio`, 25%), no engineer is idle and no extractor is being built, the macro **pulls the nearest engineer off its queue** for a mass extractor
+  (`MacroMassPriority`), and (2) the bridge adds a per-turn **checklist** to the model's message that puts MASS first: how many extractors you have, how many free mass spots there are, and the exact
+  `build mex` order to give (or an `upgrade` order when no spots are left), plus idle engineers, low power and "mass is piling up - spend it".
+- If it still ignores a rule, tell it once more in a text file and pass it with `--extra-system file.txt` (it is appended to the system prompt).
 
+## Start-up menu
+Run `python bridge/llm_bridge.py --log <game log> --server <url>` in a terminal and the bridge shows a **menu** to pick the mode
+(gateway ACUs / strict SACU / army / full game + macro / TRAIN / overlay; Enter = the mode you used last). For TRAIN it also asks whether to
+resume the saved playbook or start fresh, an episode limit and an optional restart command. The choice is written to `bridge/mode.lua`, which
+`Config.lua` reads **when a match starts** - so pick the mode first, then start (or restart) the game. If the running game reports a different mode the
+bridge warns you. Skip the menu with `--mode train` (still writes `mode.lua`) or `--no-menu` (leave the game on the mode set in `Config.lua`);
+`--menu` forces it when stdin is not a terminal.
 
 
 # What i am planning to vibe code
-- selecting what mode the LLM will run at start instead of editing lua/LLMC/Config.lua eg
-- In short nearsightedness i didn't tell claude to have the LLM wait for previous orders and build que to be completed  before issuing new ones on the same unit or engineers i think this causes the LLM to keep issuing the same order i think.
-- Auto match restart for train mode
+- UI improvements
+- Bugs 
 
 # Change Log
-04/11/2026
-Added train mode - idk how well it works yet
-
-
-# LLM Commander (Supreme Commander: Forged Alliance + LOUD)
-
-A local LLM (llama.cpp `llama-server`, Ollama, LM Studio, anything OpenAI-compatible) plays one army.
-Skirmish vs AI only. **Not multiplayer-safe** (the sim reads a local file, so other clients would desync).
-
-# LLM Commander (Supreme Commander: Forged Alliance + LOUD)
-
-A local LLM (llama.cpp `llama-server`, Ollama, LM Studio, anything OpenAI-compatible) plays one army.
-Skirmish vs AI only. **Not multiplayer-safe** (the sim reads a local file, so other clients would desync).
-
-
+- 04/11/2026 Added train mode - idk how well it works yet
+- 08/11/2026 Added Start up menu
+- 08/11/2026 Fixed bugs related to building
 
 ## Modes (`Takeover` in `lua/LLMC/Config.lua`)
 - **`micro` (default): LOUD plays everything; the LLM controls ONLY the Quantum Gateway ACUs (SACUs).** LOUD keeps its economy,
@@ -69,7 +74,7 @@ Skirmish vs AI only. **Not multiplayer-safe** (the sim reads a local file, so ot
   moment it is built and never handed back (no `release`). The LLM fights the whole war: defend, mass, attack in waves, retreat,
   raid. Because replies take seconds, units left idle for `IdleFallbackSeconds` (25) gather at a staging point in front of
   the base towards the nearest enemy (`StagingDistance`, change it with the `rally` action) instead of standing at the factory.
-  Set `Takeover = 'army'` in `Config.lua`; try it with `--selftest --selftest-mode army`.
+  Pick it in the start-up menu (or set `Takeover = 'army'` in `Config.lua`); try it with `--selftest --selftest-mode army`.
 - **`train`:** the LLM plays the whole game with no macro and no rule gates and *learns from a reward function* - see "Train mode" below.
 - **`replace`:** the AI slot's built-in AI is switched off and the LLM + macro manager play it (everything below).
 - **`overlay`:** like `replace` but the built-in AI is left running.
@@ -115,10 +120,14 @@ destroyed (`TrainEndOnAnyArmy = true`: as soon as any army dies; `false`: only w
 | destroy an enemy with a nuke | +8 |
 | finish producing a unit | +2 |
 | finish producing a Tech 4 unit | +8 |
-| mass **and** power storage both above 30% (each `TrainEcoInterval`, 10 s) | +2 x scale |
-| power storage at 100% | +3 x scale |
-| mass storage at 80% or more | +4 x scale |
-| mass wasted (storage full and overflowing) | -6 |
+| finish a **combat unit** (land/air/naval; not engineers, scouts, ACU) - extra on top of the +2 | +2 `CombatUnitReward` **+ 0.5 per combat unit finished in the previous 60 s** (max +5): 2-7 per unit, so a high **build rate** pays more |
+| finish a **defence structure** (point defence, anti-air, torpedo, shield) | +3 x tier (T1 3, T2 6, T3 9) `DefenseBuiltReward`, at most 150 per 30 min |
+| **no army:** after minute 4, an economy check (10 s) in which no combat unit finished during the previous 90 s | -2 each (`NoCombatPenalty`, `NoCombatGrace`, `NoCombatWindow`), at most -300 per 30 min (`NoCombatCap`) |
+| **mass income** (each `TrainEcoInterval`, 10 s) | +0.4 per mass/s x scale (`IncomeRewardPerMass`) |
+| power supply keeps up (energy income >= demand) | +3 x scale (`PowerBalancedReward`) |
+| healthy buffer: mass storage between 30% and 95% **and** power storage above 30% | +2 x scale (`HealthyBufferReward`) |
+| a mass extractor finishes upgrading to T2 / T3 | +10 / +20 (`MexUpgradeRewardT2/T3`) |
+| mass wasted (storage full and still overflowing) | -6 |
 | power storage under 20% | -2 |
 | power at 0 | -4 |
 | mass at 0 | -4 |
@@ -129,6 +138,13 @@ destroyed (`TrainEndOnAnyArmy = true`: as soon as any army dies; `false`: only w
 | **LOSS** (your army destroyed) | **-500** (`LossReward`) |
 | timeout (no winner within `TrainMaxSeconds`) | -250 (`TimeoutReward`) |
 | every game minute | -5 (`TimePenaltyPerMinute`), at most -250 in total (`TimePenaltyCap`) |
+
+**Why the economy rewards look like this** (from the game's wiki, https://supcom.fandom.com/wiki/Economy): in Supreme Commander resources are never scarce,
+what matters is *income* versus *expenditure* and *time* - more income sooner means more units sooner, and upgrading an extractor triples its mass, so
+mass income and extractor upgrades are rewarded. Resources must be stored and anything generated beyond storage is **wasted**, so mass storage that is full and still
+overflowing is penalised (power overflow is normal - power income is always far larger than mass income - and is not penalised) and a big hoard is no longer rewarded (the old "mass storage >= 80% +4" and "power at 100% +3" are gone). Running out of a
+resource halts construction (an energy shortage also switches off radar and shields), so zero/low storage is penalised. Power has no direct score - it is
+rewarded for *keeping up with demand*, because everything else (extractors, factories, fabricators, shields) runs on it.
 
 **Game length:** short games last 20-30 minutes, long ones 1-3 hours, and the opponent gets tougher the longer a game runs - so early wins are worth
 the most: the end-of-game reward for a win is +750 after 20 minutes (500 + 250 speed bonus), +650 after 1 hour, +500 after 2 hours or more, against -500 for a loss.
@@ -158,19 +174,46 @@ serving**. So:
 
 **Running it**
 ```
-python bridge/llm_bridge.py --log <game log> --server http://127.0.0.1:8080/v1 --restart-cmd "<command that restarts the match>" --max-episodes 50
+python bridge/llm_bridge.py --log <game log> --server http://127.0.0.1:8080/v1 --max-episodes 50
 ```
-The mod cannot restart a match from inside the game, so at the end of an episode the bridge (after reflecting and saving) runs
-`--restart-cmd` - e.g. a script that kills the game and relaunches it into your saved skirmish setup (an AutoHotkey script or batch
-file you write for your own LOUD launcher). Without `--restart-cmd` it prints a message and simply continues when you start the next
-match. When an episode ends the bridge prints a banner (and appends it to `bridge/train/train.log`; the game log gets a matching `LLMC|I|EPISODE HAS ENDED` line) that says
+**Automatic restart.** When an episode ends the match restarts itself with `RestartSession()` - the call LOUD's own menu uses. That function only exists in the UI Lua
+state, so a UI hook (`hook/lua/UserSync.lua`) calls it. The restart waits for the bridge: it first finishes its reflection and saves the playbook, *then* it asks for the restart, so the next
+match always starts with the updated lessons. There are two independent signals:
+1. **Primary (does not need the sim):** the bridge writes a NEW token into `bridge/restart.lua`; a UI thread polls that file every 2 s. The token present when a match
+   starts is the baseline, so an old request can never restart a new match.
+2. **Backup:** the bridge also sets a restart flag in `inbox.lua`; the sim sees it and sets `Sync.LLMC_Restart` (repeated for 20 s because Sync fields last one tick).
+After the restart the mod reads `mode.lua` again (still train mode) and the bridge starts the next episode by itself.
+
+**If the match does not restart:** the bridge waits `--restart-timeout` (90 s) and then prints a box explaining what to check; the playbook is already saved. The game log (and the
+bridge console as `[game] ...`) shows how far it got: `LLMC|I|UI restart watcher started` at the start of every match = the UI hook is loaded (if it is missing, LOUD does not load
+`hook/lua/UserSync.lua` / has no `OnSync`); `LLMC|I|Restart requested (...) - calling RestartSession() now` = the watcher saw the request; `LLMC|I|ERR RestartSession() failed: ...` = the
+call itself failed and says why. `--restart-fallback-cmd "<command>"` runs a command of your choice (e.g. a script that relaunches the game) when the automatic restart did not happen in time.
+Other flags: `--no-game-restart` (never restart automatically), `--restart-cmd "<command>"` (use an external command instead of the in-game restart). Settings in `Config.lua`:
+`AutoRestart`, `RestartWaitSeconds`. The last episode (`--max-episodes`) is not restarted.
+When an episode ends the bridge prints a banner (and appends it to `bridge/train/train.log`; the game log gets a matching `LLMC|I|EPISODE HAS ENDED` line) that says
 the episode ended, where the playbook (`lessons.json`) and logs are saved, the exact command to **resume in a new session** (run it again with the same `--train-dir`;
-it continues at the next episode with the saved playbook) and what to do next: start a new game. Files in `bridge/train/`: `stats.csv` (one row per episode: result, return, kills, losses, ...), `lessons.json`, `best.json`,
+it continues at the next episode with the saved playbook) and what happens next (the match restarts by itself, or start a new game). Files in `bridge/train/`: `stats.csv` (one row per episode: result, return, kills, losses, ...), `lessons.json`, `best.json`,
 `episodes/ep_NNNN.jsonl` (every step), `dataset.jsonl`, `prompts/`. Self-test: `--selftest --selftest-mode train`.
+
+
+**Wait for orders to finish** (`TrainWaitForOrders`, `TrainWaitSquads`, `TrainMaxJobsPerTurn`): the agent kept re-issuing the same orders on top of queues that had
+not finished yet. In train mode a builder, factory or unit now takes a NEW order only if it was idle (nothing queued) when the turn's orders arrived: engineers and the
+ACU accept build/assist/reclaim orders only while idle (an idle builder may get up to 3 jobs in the same turn - a short queue - then must finish them); a factory
+accepts a `produce` order only when its queue is empty (so queue big batches) and a factory upgrade only when idle; combat units accept attack/move/patrol/scout only
+when idle (`retreat` and `stop` always work). Refused orders say why in `state.last_results`; `state.alerts` says when every builder or factory is busy; and the reflection
+step is told when the same orders were repeated for several turns in a row.
+
+**If the agent gets stuck repeating itself** (for example only ever building factories and never power): build orders *queue* behind a builder's current
+job, and the old state only showed finished buildings, so the model kept re-ordering what it could not yet see. Train mode now (1) shows
+`state.under_construction`, the ACU's `queued_jobs` and plain-language `state.alerts` (power low, no power generator, factory already being built, idle
+engineers), (2) refuses a build while that kind is already under construction/queued (`TrainMaxPending`: 1 factory per type, 3 pgen, 4 mex, ...) and gives no
+new orders to a builder with 4+ queued jobs (`TrainMaxQueue`), (3) has the prompt explain queues and a concrete opening, and (4) feeds the reflection step
+diagnostics ("70% of your builds were land_factory", "no power generator was ever ordered"). If your playbook was written after such episodes it may have kept the bad habit: start
+once with `--reset-lessons` (the old playbook is kept as `lessons.json.old`).
 
 **Things to know:** the reward can be gamed - producing units pays +2 each (cheap scouts/engineers count), and sitting on full storage
 pays +3/+4 per 10 s, which can outweigh fighting; the reflection step sees the breakdown and usually notices, but watch `stats.csv`
-(kills vs. units built). Whether `OnKilled`'s instigator and the nuke category look the way I assumed in LOUD is untested; if the
+(kills vs. units built). Untested against LOUD: `OnKilled`'s instigator and the nuke category, and the restart path (that LOUD's `UserSync.lua` still has an `OnSync` to hook, that custom `Sync` fields reach the UI, and that the sim keeps running after an army is defeated so it can request the restart; if the match never restarts, check the game log for `LLMC|I|Playbook saved` and `Restarting the match`, or use `--restart-cmd`); if the
 breakdown never shows `kill_artillery` / `kill_nuke` that is the first thing to check.
 
 ## How it works
@@ -185,10 +228,6 @@ last orders did). The LLM answers with a JSON list of high-level orders (`build`
 `attack`, `scout`, ...). The mod resolves them to real blueprint IDs for your faction (so it works with
 LOUD's units), finds legal build spots, and issues the commands. Every order is validated; the file the
 game loads is plain Lua literals run in an empty environment.
-
-## Install (moved to top)
-
-
 
 ## Built-in macro manager (v2)
 `lua/LLMC/Macro.lua` plays the routine game like the stock AI, every 6 game seconds, regardless of LLM speed:
@@ -230,3 +269,9 @@ storage are always allowed. Applies to the macro and to LLM orders; the very fir
 ## Config (`lua/LLMC/Config.lua`)
 `Army` (auto or a number), `Takeover` (`replace` | `overlay`), `StateInterval`, `MaxActionsPerTurn`, `UseACUToBuild`, `RevealEnemyStarts`.
 Bridge flags: `--temperature`, `--max-tokens` (default 2500), `--no-json-mode`, `--extra-system file.txt` (e.g. `/no_think` for Qwen3), `-v`.
+
+## Fairness
+The LLM only sees enemy units you can see (omni/vision) or structures you have seen before; radar-only blips are
+counted but not identified. It is told enemy start positions (config `RevealEnemyStarts`).
+
+
