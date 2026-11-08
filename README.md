@@ -34,10 +34,6 @@ An 8B model can follow the JSON format but loses track of a long game state, so 
   16k context is plenty, the prompts are 3-6k tokens). Bridge: `--temperature 0.3 --max-tokens 1500` (lower temperature = steadier JSON). If the server rejects JSON mode add `--no-json-mode`.
 - **Pick the right mode.** `replace` (full game + macro manager) works best: the macro builds the routine and the LLM only steers. `army` and the gateway modes need less from the model. `train` is
   the hardest for an 8B model - expect many early episodes to go badly.
-- **"It forgets about mass" (replace mode):** the macro only added mass extractors with *idle* engineers, and a small model keeps every engineer busy with its own orders, so mass was never served.
-  Now (1) when stored mass is low (`MacroMassPriorityRatio`, 25%), no engineer is idle and no extractor is being built, the macro **pulls the nearest engineer off its queue** for a mass extractor
-  (`MacroMassPriority`), and (2) the bridge adds a per-turn **checklist** to the model's message that puts MASS first: how many extractors you have, how many free mass spots there are, and the exact
-  `build mex` order to give (or an `upgrade` order when no spots are left), plus idle engineers, low power and "mass is piling up - spend it".
 - If it still ignores a rule, tell it once more in a text file and pass it with `--extra-system file.txt` (it is appended to the system prompt).
 
 ## Start-up menu
