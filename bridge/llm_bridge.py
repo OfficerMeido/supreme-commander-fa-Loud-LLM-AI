@@ -32,12 +32,12 @@ PREFIX = b"LLMC|"
 
 ALLOWED_ACTIONS = {
     "build", "produce", "upgrade", "assist", "reclaim", "enhance",
-    "attack", "move", "patrol", "retreat", "stop", "scout", "rally", "strategy",
+    "attack", "move", "patrol", "retreat", "stop", "scout", "rally", "strategy", "mex_defense",
 }
 
-MICRO_ACTIONS = {"order", "focus", "scout", "release", "sacu", "defense_cluster", "mass_farm", "experimental", "assist_t4", "rally"}
+MICRO_ACTIONS = {"order", "focus", "scout", "release", "sacu", "defense_cluster", "mass_farm", "experimental", "assist_t4", "rally", "mex_defense"}
 
-GATEWAY_ACTIONS = {"sacu", "defense_cluster", "mass_farm", "experimental", "assist_t4"}
+GATEWAY_ACTIONS = {"sacu", "defense_cluster", "mass_farm", "experimental", "assist_t4", "mex_defense"}
 
 GATEWAY_PROMPT = """You are LLM Gateway, the commander of the Quantum Gateway ACUs (SACUs) of a Supreme Commander: Forged Alliance (LOUD mod) army.
 The built-in LOUD AI plays the whole game: economy, tech, base, unit production, all combat units and its attack plans. You do NOT control any of that and you cannot give orders to any normal unit.
@@ -91,6 +91,7 @@ STATIC DEFENSES RULE: you only worry about base-defense BUILDINGS (shield, SAMs,
    b) MASS IS NOT BEING USED (state.eco.mass high, e.g. >= 0.7, or state.rescue_active): build Tech 4 units: {"a":"experimental","what":"land"|"air"|"any","near":[x,z],"n":1}. Do not stack several experimentals at once.
    c) Otherwise, when mass is short: {"a":"mass_farm","near":[x,z]} = a Tech 3 power plant surrounded by 16 T2 mass fabricators (limited number of farms; expensive).
    d) TECH 4 UNDER CONSTRUCTION (state.t4_under_construction = true: an experimental unit or building, built by you or by the AI): idle gateway ACUs ASSIST it so it finishes sooner: {"a":"assist_t4"} (the mod does this automatically; add "force":true to pull all gateway ACUs in).
+   e) MASS EXTRACTORS WITHOUT DEFENCES: {"a":"mex_defense","n":3} = a point defence and an anti-air next to mass extractors that lack them (most exposed first). The mod also does this automatically when a gateway ACU is idle.
    Move or recall them with {"a":"sacu","cmd":"move"|"retreat"|"stop","x":X,"z":Z}. The mod also runs these rules automatically when a gateway ACU is idle; check state.auto_recent and do not duplicate what it just ordered.
 6. Raid and scout: bombers/gunships against weakly defended enemy clusters; scouts to unexplored enemy start positions: {"a":"scout","x":X,"z":Z}.
 7. state.rescue_active=true means the AI had stalled (idle builders while mass/energy floated) and the mod's macro manager is temporarily spending resources for it (see state.macro_recent). You do not handle that - keep micro-managing units only.
@@ -137,6 +138,7 @@ ACTIONS (each is an object with key "a"):
  {"a":"upgrade","what":"mex"|"land_factory"|"air_factory"|"naval_factory","n":2}   (or {"a":"upgrade","id":"<unit id>"})
  {"a":"assist","target":"<upgrading mex id or enhancing ACU id>","n":3}   engineers help; only valid for those two
  {"a":"reclaim","near":[x,z],"radius":40,"n":2}      engineers reclaim wrecks/trees for resources
+ {"a":"mex_defense","n":3}      a point defence + an anti-air next to mass extractors that lack them (most exposed first); the macro does this automatically too
  {"a":"enhance","name":"<name from state.acu.enhancements>"}
  {"a":"attack","squad":SQUAD,"x":X,"z":Z,"fraction":1.0}   attack-move; also "move", "patrol"; "points":[[x,z],[x,z]] for several waypoints; "queue":true to append
  {"a":"retreat","squad":SQUAD}   {"a":"stop","squad":SQUAD}   {"a":"scout","x":X,"z":Z}   {"a":"rally","factory":"all","x":X,"z":Z}
@@ -145,6 +147,7 @@ ACTIONS (each is an object with key "a"):
 RULES
 - Coordinates are world [x, z]. Use state.free_mass / free_hydro / contacts / enemy_starts / base for positions.
 - Unit ids in the state are strings; copy them exactly.
+- RADARS must be at least 115 apart (they would cover the same ground): never order a second radar within 115 of another one - orders that break this are refused.
 - Do not repeat orders that are already in progress (check factories[].queue, engineers.idle, structures counts).
 - Read state.last_results: it tells you which of your last orders failed and why.
 - ECONOMY-ONLY OPENING: while state.economy_only_until is present (first 5 game minutes) only mex, hydro, pgen, fabricator, storage, engineers and mex upgrades work; everything else is refused. Focus on economy and use the time to plan.
@@ -195,7 +198,7 @@ The episode (training step) ends when an army is destroyed - yours or the enemy'
 ORDERS (each is an object with key "a"; at most 24 per turn; state.can_build tells what works at which tech):
  {"a":"build","what":KIND,"n":1,"tech":1,"near":"base"|[x,z],"radius":30}   KIND = mex hydro pgen fabricator land_factory air_factory naval_factory omni radar sonar shield aa torpedo pd arty mass_storage energy_storage (or "unit_id":"ueb4202"). mex/hydro snap to free resource spots.
  {"a":"produce","factory":"all"|"land"|"air"|"naval"|"<factory id>","what":UNITKIND,"n":5,"tech":2}   UNITKIND = engineer land_scout tank artillery land_aa air_scout fighter bomber gunship warship submarine experimental
- {"a":"upgrade","what":"mex"|"land_factory"|"air_factory"|"naval_factory","n":2} (or "id")   {"a":"assist","target":"<id>","n":3}   {"a":"reclaim","near":[x,z],"radius":40,"n":2}   {"a":"enhance","name":"<state.acu.enhancements name>"}
+ {"a":"mex_defense","n":3}  (a point defence + an anti-air next to mass extractors that lack them)   {"a":"upgrade","what":"mex"|"land_factory"|"air_factory"|"naval_factory","n":2} (or "id")   {"a":"assist","target":"<id>","n":3}   {"a":"reclaim","near":[x,z],"radius":40,"n":2}   {"a":"enhance","name":"<state.acu.enhancements name>"}
  {"a":"attack","squad":SQUAD,"x":X,"z":Z,"fraction":1.0}  (also "move", "patrol", "points":[[x,z],..], "queue":true)   {"a":"retreat","squad":SQUAD}   {"a":"stop","squad":SQUAD}   {"a":"scout","x":X,"z":Z}   {"a":"rally","factory":"all","x":X,"z":Z}
      SQUAD = land fighters bombers gunships naval air scouts all (engineers and the ACU are never in squads). Engineers build, assist and reclaim; use state.engineers.idle_ids / idle count: idle engineers are wasted.
 Coordinates are world [x, z]. Unit ids in the state are strings. Read state.last_results: it says which orders failed and why.
@@ -204,7 +207,9 @@ HOW BUILDING WORKS - read this, it is the most common mistake: build orders QUEU
  - state.under_construction = what is being built right now (e.g. {"land_factory":1}); state.acu.queued_jobs = the ACU's queue length; state.alerts = plain-language problems to fix FIRST.
  - WAIT FOR ORDERS TO FINISH (important): a builder, factory or unit takes a NEW order only when it has finished the previous ones. Engineers and the ACU accept build orders only while idle (state.engineers.idle_ids, state.acu.idle) and then up to 3 jobs in ONE turn; a factory accepts a produce order only when its queue is EMPTY (factories[].idle) - you may give it up to 3 produce orders in the SAME turn - put ENGINEERS first, then combat units (e.g. engineer x3, then tank x10) - and it works through them while you wait; combat units accept attack/move/patrol/scout orders only when idle (retreat and stop always work). Orders to busy ones are refused: do NOT repeat them, wait.
  - Orders for a kind that is already under construction or queued are also REFUSED (limits at a time: 1 factory of each type, 3 pgen, 4 mex, ...). Read state.last_results for these refusals and give DIFFERENT orders to the builders that ARE idle instead of repeating yourself.
- - POWER COMES FIRST: everything costs energy. If state.alerts says power is low, or energy income is below demand, build pgen BEFORE anything else - but ONLY while power is actually short: once storage is nearly full and income >= demand, more pgen are refused and useless (state.alerts says so). Never answer with only factories, and never with only pgen.
+ - ASSIST only helps something that is really under construction or upgrading; assisting an idle unit or another helper is refused. An engineer that is left assisting something which has stopped building is released automatically after a few seconds, and state.engineers.idle_ids / state.acu.idle already count such engineers as idle.
+ - POWER COMES FIRST: everything costs energy. Power is LOW when your energy INCOME is under 60/s while your best factory is tech 1 (the 20/s you start with IS low - a full storage at the start does not mean you have enough), under 200/s at tech 2 and under 500/s at tech 3 (state.power_low_income, state.tech_level, state.alerts). While power is LOW or income is below demand, build pgen BEFORE anything else. Once income is above the threshold for your tech AND storage is nearly full, more pgen are refused and useless. Never answer with only factories, and never with only pgen.
+ - DEFENCES AND RADAR: build a point defence and an anti-air next to your mass extractors ({"a":"mex_defense","n":3}; state.mex_defense shows how many extractors lack them) - losing an extractor costs -4. Radars must be at least 115 apart: orders for a radar closer than that to another radar are refused.
 ECONOMY FACTS (from the game's wiki): mass comes mostly from mass extractors - T1 +2 M/s for 2 E/s upkeep, upgraded to T2 +6 M/s for 9 E/s, T3 about 12-18 M/s for 36-54 E/s - so UPGRADING extractors is the cheapest way to multiply income. Energy comes from power generators (T1 pgen 20 E/s, hydrocarbon plant 100 E/s on its special spots, T2 pgen 500 E/s, T3 2500 E/s) and everything draws on it; mass fabricators turn a LOT of energy into a little mass (about 150 E per 1 M for a T2 fab) - only worth it with surplus power. Storage buildings only add capacity. Resources must be stored: income that does not fit is wasted, so keep spending it. Time is the key: more income sooner means more units sooner.
 OPENING (first ~3 minutes): the ACU is idle at the start, so give it its three jobs in ONE turn: mex x2 (near free_mass), pgen x2, then ONE land_factory, and then let it work. When the factory exists: produce engineer x3 FIRST, then in the same turn tank x10. AFTER THE OPENING (about 4 mex, 2-4 pgen): as soon as the factory exists START PRODUCING COMBAT UNITS (tank / fighter / ..., batches of n=10) and keep EVERY factory producing - an army that does not exist costs reward after 4 minutes. Engineers: more mex on free_mass and mex upgrades, a second factory, defences, radar; build power ONLY while it is short (do not keep ordering pgen - after the first few it is rarely needed). Spread orders over DIFFERENT kinds each turn (mex, engineers, factory, units, defences...), and use idle engineers.
 Also: never let mass or power run empty, and spend mass before it overflows (power overflow does not matter - big power income with small mass income is normal); scout early; do not feed units piecemeal; defend your commander; use the lessons below.
@@ -319,9 +324,47 @@ def train_checklist(state):
     idle_eng = eng.get("idle_ids") or []
     if idle_eng:
         items.append("IDLE ENGINEERS %s: give each a job (mass extractor on free_mass, a factory, defences, assist an upgrade)." % idle_eng[:8])
+    md = state.get("mex_defense") or {}
+    if md.get("undefended") and md.get("mex", 0) >= 2:
+        items.append('%d of your %d mass extractors have no point defence / anti-air next to them: {"a":"mex_defense","n":3}' % (md["undefended"], md["mex"]))
     if not items:
         return "TURN CHECKLIST: nothing is idle right now - do NOT repeat earlier orders; plan the next steps or wait."
     return "TURN CHECKLIST (do these THIS turn, in this order; skip what does not apply):\n- " + "\n- ".join(items)
+
+
+def replace_checklist(state):
+    """Per-turn 'do this now' list for the full-game (replace) mode. Small models forget MASS, so it comes first."""
+    items = []
+    eco = state.get("eco") or {}
+    mass = eco.get("mass") or {}
+    energy = eco.get("energy") or {}
+    ratio, inc = mass.get("stored_ratio"), mass.get("income")
+    fm = state.get("free_mass") or []
+    mex_tiers = (state.get("structures") or {}).get("mex") or {}
+    mex_count = sum(v for v in mex_tiers.values() if isinstance(v, (int, float)))
+    pct = "%d%%" % round(ratio * 100) if isinstance(ratio, (int, float)) else "?"
+    if fm and (mex_count < 10 or (isinstance(ratio, (int, float)) and ratio < 0.4)):
+        x, z = fm[0][0], fm[0][1]
+        items.append('MASS FIRST: you have %d mass extractors (mass income %s/s, %s stored) and %d FREE mass spots (nearest at %s,%s). Mass builds everything - build more now: {"a":"build","what":"mex","n":%d,"near":[%s,%s]}.'
+                     % (mex_count, inc, pct, len(fm), x, z, min(3, len(fm)), x, z))
+    elif mex_count and not fm and (not isinstance(ratio, (int, float)) or ratio < 0.5):
+        items.append('MASS: no free mass spots are left - raise mass by UPGRADING extractors: {"a":"upgrade","what":"mex","n":2}.')
+    if isinstance(ratio, (int, float)) and ratio > 0.8:
+        items.append("Mass is piling up (%s stored): SPEND it - queue units in the factories, build another factory, upgrade extractors." % pct)
+    er, einc = energy.get("stored_ratio"), energy.get("income")
+    low_t = state.get("power_low_income") or {1: 60, 2: 200, 3: 500}[min(3, max([f.get("tech", 1) for f in (state.get("factories") or [])] + [1]))]
+    if (isinstance(er, (int, float)) and er < 0.25) or (isinstance(einc, (int, float)) and einc < low_t):
+        items.append('POWER LOW: energy income %s/s (low = under %d/s for your tech level), %s stored: build power generators: {"a":"build","what":"pgen","n":2}.'
+                     % (einc, low_t, ("%d%%" % round(er * 100)) if isinstance(er, (int, float)) else "?"))
+    md = state.get("mex_defense") or {}
+    if md.get("undefended") and md.get("mex", 0) >= 3:
+        items.append('MASS EXTRACTOR DEFENCE: %d of %d extractors have no point defence / anti-air next to them: {"a":"mex_defense","n":3}.' % (md["undefended"], md["mex"]))
+    idle = (state.get("engineers") or {}).get("idle_ids") or []
+    if idle:
+        items.append("IDLE ENGINEERS %s: give them jobs - mass extractors first, then power, then factories." % idle[:8])
+    if not items:
+        return "TURN CHECKLIST: economy looks fine - concentrate on strategy (state.strategy, attacks, scouting)."
+    return "TURN CHECKLIST (do these THIS turn, in this order):\n- " + "\n- ".join(items)
 
 
 class Assembler:
@@ -622,6 +665,8 @@ class Bridge:
         mode = state.get("mode")
         if mode == "train":
             user = user.replace("\n\nAnswer with the JSON object only.", "\n\n" + train_checklist(state) + "\n\nAnswer with the JSON object only.")
+        elif mode not in ("micro", "sacu", "army"):
+            user = user.replace("\n\nAnswer with the JSON object only.", "\n\n" + replace_checklist(state) + "\n\nAnswer with the JSON object only.")
         if mode == "train":
             base_prompt = TRAIN_PROMPT + "\n\n" + self.get_trainer().context_text()
         elif mode == "army":
