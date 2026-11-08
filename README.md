@@ -25,9 +25,11 @@ In `replace` mode look for `LLMC|I|INFO built-in AI disabled for ARMY_n` in the 
 | Model | Notes |Get it Here|
 |-------|-------|-----------|
 | **Qwen3.8-9B-Distill-GGUF** | Any of the GGUF variants work fine. limit reasoning to 512 `--reasoning-budget 512` |[Qwen3.8-9B-Distill-GGUF](https://huggingface.co/empero-ai/Qwen3.8-9B-Distill-GGUF/tree/main)
-|**Hermes-3-Llama-3.1-8B-GGUF**| Any of the GGUF variants work fine.|https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B-GGUF/tree/main|
+|**Hermes-3-Llama-3.1-8B-GGUF**| Any of the GGUF variants work fine.|[Hermes-3-Llama-3.1-8B-GGUF](https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B-GGUF/tree/main)|
 ---
 
+
+ 
 ## Using a small local model (e.g. Hermes-3-Llama-3.1-8B Q4_K_M)
 An 8B model can follow the JSON format but loses track of a long game state, so use it where the mod does the heavy lifting. Suggestions:
 - **Server:** `llama-server -m Hermes-3-Llama-3.1-8B.Q4_K_M.gguf -c 16384 -ngl 99 --jinja --port 8080` (Hermes-3 uses the ChatML template that is stored in the GGUF; `--jinja` applies it;
