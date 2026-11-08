@@ -98,10 +98,10 @@ local function Scan(brain, cfg)
                 end
             elseif done and s.COMMAND then
                 if u:IsUnitState('Enhancing') then c.acuEnhId = tostring(u:GetEntityId()) end
-                if u:IsIdleState() and cfg.UseACUToBuild then c.engIdle = c.engIdle + 1 end
+                if K.EffectivelyIdle(u) and cfg.UseACUToBuild then c.engIdle = c.engIdle + 1 end
             elseif done and s.ENGINEER and s.MOBILE then
                 c.engTotal = c.engTotal + 1
-                if u:IsIdleState() then c.engIdle = c.engIdle + 1 c.engIdleEng = c.engIdleEng + 1 end
+                if K.EffectivelyIdle(u) then c.engIdle = c.engIdle + 1 c.engIdleEng = c.engIdleEng + 1 end
             elseif done and s.MOBILE then
                 local role = K.MobileRole(bpid)
                 if c.army[role] then c.army[role] = c.army[role] + 1 end
@@ -201,7 +201,9 @@ function Tick(brain, cfg, now, rescue)
     end
 
     -- 1. energy
-    local energyShort = (enInc < enDem * 1.05) or enR < 0.3 or (rescue and massR > 0.6 and enR < 0.5)
+    -- power is LOW when income is under the threshold for the current tech level (T1 60/s, T2 200/s, T3 500/s by default)
+    local lowE = (cfg.PowerLowIncome or { 60, 200, 500 })[math.min(facBest, 3)] or 60
+    local energyShort = (enInc < enDem * 1.05) or enR < 0.3 or (enInc < lowE) or (rescue and massR > 0.6 and enR < 0.5)
     -- rescue: energy piling up but mass short -> mass fabricators turn the spare energy into mass
     if rescue and idleLeft > 0 and enR >= 0.9 and massR < 0.5 and Ready('fab', now) then
         Add({ a = 'build', what = 'fabricator', n = 1, tech = S.tech, near = base, radius = 40, idle_only = true })
@@ -227,6 +229,16 @@ function Tick(brain, cfg, now, rescue)
         Add({ a = 'build', what = 'mex', n = math.min(idleLeft, 3), tech = 1, near = base, radius = rad, idle_only = true })
         idleLeft = idleLeft - math.min(idleLeft, 3)
         Wait('mex', now, 10)
+    end
+    -- MASS PRIORITY: mass is what everything is built from. When stored mass is low, no engineer is idle (the LLM keeps them
+    -- all busy with its own orders) and no mass extractor is already being built, pull the nearest engineer off its queue for one.
+    if idleLeft <= 0 and cfg.MacroMassPriority ~= false and c.mex < 30 and c.mexUnfinished == 0
+       and massR < (cfg.MacroMassPriorityRatio or 0.25) and Ready('mexprio', now) then
+        local rad = 90
+        if now > 600 then rad = 180 end
+        Add({ a = 'build', what = 'mex', n = 1, tech = 1, near = base, radius = rad, priority = true })
+        Wait('mexprio', now, 25)
+        Note(now, 'mass is low (' .. math.floor(massR * 100) .. '%): an engineer was pulled off its queue to build a mass extractor')
     end
 
     -- 3. more factories as the economy grows
@@ -255,6 +267,13 @@ function Tick(brain, cfg, now, rescue)
         Add({ a = 'build', what = 'radar', n = 1, tech = 1, near = base, radius = 30, idle_only = true })
         idleLeft = idleLeft - 1
         Wait('radar', now, 90)
+    end
+
+    -- 4b. mass extractor defences: a point defence and an anti-air next to every mass extractor (most exposed first)
+    if idleLeft > 0 and not ecoOnly and cfg.MacroMexDefense ~= false and c.mex >= 3 and massR > 0.15 and Ready('mexdef', now) then
+        Add({ a = 'mex_defense', n = 2, idle_only = true })
+        idleLeft = idleLeft - 1
+        Wait('mexdef', now, 60)
     end
 
     -- 5. TECH UP

@@ -88,6 +88,31 @@ Config = {
     TrainPowerFull = 0.8,
     TrainPowerSurplus = 1.0,
 
+    -- POWER LEVELS: energy income (per second) under these is LOW for the tech level you have reached
+    -- (highest finished factory tier): tech 1, tech 2, tech 3. The start (the ACU's 20/s) is low for tech 1.
+    PowerLowIncome = { 60, 200, 500 },
+    -- No mass-waste penalty for this many seconds at the start (mass storage starts full before anything can be spent).
+    MassWasteGrace = 120,
+
+    -- RADAR SPACING: two radars are never built closer than this to each other (all modes where this mod builds radars).
+    RadarSpacing = 115,
+
+    -- MASS EXTRACTOR DEFENCES (all modes): a point defence and an anti-air next to every mass extractor.
+    -- Engineer modes (replace/train): the macro / the LLM's mex_defense order. Gateway-ACU modes (micro/sacu/army): the gateway ACUs.
+    MexDefensePD = 1,            -- point defences wanted within MexDefenseCover of each extractor
+    MexDefenseAA = 1,            -- anti-air structures wanted
+    MexDefenseCover = 20,        -- an extractor counts as covered when enough PD/AA stand within this distance
+    MexDefenseRadius = 12,       -- build the defences within this distance of the extractor
+    MexDefenseTech = 2,          -- highest tech used (T2 if buildable, else T1)
+    MacroMexDefense = true,      -- replace mode: the macro builds them with idle engineers
+    GatewayMexDefense = true,    -- micro/sacu/army modes: the gateway-ACU autopilot builds them
+
+    -- DEAD ASSIST ORDERS: an engineer / ACU that only "assists" a unit which has finished (or does nothing) stands there forever
+    -- and blocks everything queued behind that order. After StaleAssistSeconds of this its commands are cleared (replace and
+    -- train modes: engineers + ACU; the gateway-ACU modes: the gateway ACUs). Turn off with CleanStaleAssist = false.
+    CleanStaleAssist = true,
+    StaleAssistSeconds = 6,
+
     -- WAIT FOR ORDERS TO FINISH (train mode): a builder / factory / unit takes new orders only when it was idle (nothing queued)
     TrainWaitForOrders = true,   -- engineers, the ACU and factories (also factory upgrades, assist, reclaim)
     TrainWaitSquads = true,      -- combat units too: attack/move/patrol/scout go only to idle units (retreat and stop always work)
@@ -143,6 +168,8 @@ Config = {
     -- Built-in macro manager (like the stock AI): economy, tech-ups, factories, engineers, production,
     -- defence and attack waves. The LLM steers it with the "strategy" action and can still give any order.
     Macro = true,
+    MacroMassPriority = true,        -- low mass + no idle engineer: pull an engineer off its queue for a mass extractor (replace mode)
+    MacroMassPriorityRatio = 0.25,   -- 'low' = stored mass below this fraction
     MacroInterval = 6,     -- game seconds between macro decisions
     AutoAttack = true,     -- macro sends attack waves / defends the base
     TechTarget = 3,        -- highest tech tier to upgrade mex and factories to (1-3)

@@ -23,6 +23,7 @@ IncomeMass, PowerBalancedR, BufferR, MexT2R, MexT3R = 0.4, 3, 2, 10, 20
 CombatR, CombatRate, CombatCap, CombatWindow, DefR, DefCap, DefPaid = 2, 0.5, 10, 60, 3, 150, 0
 CombatTimes = {}          -- game times at which our recent combat units finished (for the production-RATE bonus)
 NoCombatPenalty, NoCombatGrace, NoCombatWindow, NoCombatCap, NoCombatPaid, LastCombat = -2, 240, 90, 300, 0, -1
+WasteGrace = 120          -- no mass-waste penalty at the very start: mass storage starts full before anything could be spent
 Totals = {}               -- reward name -> total this episode
 Counts = {}               -- reward name -> how many times this episode
 StepParts = {}            -- reward name -> total since the last observation
@@ -45,6 +46,7 @@ function Reset(idx, cfg)
     CombatTimes = {}
     NoCombatPenalty, NoCombatGrace, NoCombatWindow, NoCombatCap = cfg.NoCombatPenalty or -2, cfg.NoCombatGrace or 240, cfg.NoCombatWindow or 90, cfg.NoCombatCap or 300
     NoCombatPaid, LastCombat = 0, -1
+    WasteGrace = cfg.MassWasteGrace or 120
 end
 
 function Stop() Active = false end
@@ -197,7 +199,7 @@ function EcoTick(brain, now)
     elseif er < 0.2 then Add('power_low', -2) end
     -- WASTE (full value): mass that does not fit into storage is lost. Power overflow is normal (power income is far larger
     -- than mass income: +1000 energy against +1 mass is fine) and is NOT penalised.
-    if mr >= 0.99 and mInc > mDem then Add('mass_waste', -6) end
+    if mr >= 0.99 and mInc > mDem and (now or 0) >= WasteGrace then Add('mass_waste', -6) end
     -- POSITIVE (scaled and capped): income wins games
     if mInc > 0 then AddEco('mass_income', IncomeMass * mInc) end
     if er > 0.05 and eInc >= eDem then AddEco('power_balanced', PowerBalancedR) end          -- supply meets demand

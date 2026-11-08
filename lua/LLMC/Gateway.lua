@@ -287,3 +287,72 @@ function Experimental(ctx, a)
     for i = 1, n do IssueBuildMobile(ctx.sacus, Vec(x, z), bpid, {}) end
     Say(ctx, string.format('experimental: %d x %s queued near %d,%d', n, bpid, x, z))
 end
+
+
+---------------------------------------------------------------------------------------------------
+-- MEX DEFENCE: a point defence and an anti-air next to mass extractors that lack them, built by the gateway ACUs
+---------------------------------------------------------------------------------------------------
+function MexDefense(ctx, a)
+    if not NeedSacus(ctx, 'mex_defense') then return end
+    local b = ctx.sacus[1]
+    local f = ctx.faction
+    local tech = Num(a.tech, ctx.cfg.MexDefenseTech or 2, 1, 3)
+    local cover = Num(a.cover, ctx.cfg.MexDefenseCover or 20, 5, 60)
+    local radius = Num(a.radius, ctx.cfg.MexDefenseRadius or 12, 4, 30)
+    local wantPD, wantAA = Num(a.pd, ctx.cfg.MexDefensePD or 1, 0, 3), Num(a.aa, ctx.cfg.MexDefenseAA or 1, 0, 3)
+    local pdBp = K.BestBuildable(b, K.Candidates(K.Structures.pd, f), tech)
+    local aaBp = K.BestBuildable(b, K.Candidates(K.Structures.aa, f), tech)
+    if not (pdBp or aaBp) then return Say(ctx, 'mex_defense: the gateway ACUs cannot build point defence or anti-air') end
+
+    local mexes, pds, aas = {}, {}, {}
+    for _, u in ipairs(ctx.all) do
+        if not u.Dead then
+            local bpid = u:GetUnitId()
+            if K.CatSet(bpid).STRUCTURE then
+                local k = K.StructureKind(bpid)
+                if k == 'mex' then table.insert(mexes, u:GetPosition())
+                elseif k == 'pd' then table.insert(pds, u:GetPosition())
+                elseif k == 'aa' then table.insert(aas, u:GetPosition()) end
+            end
+        end
+    end
+    local function Count(list, x, z)
+        local n = 0
+        for _, p in ipairs(list) do
+            if Dist(p[1], p[3], x, z) <= cover then n = n + 1 end
+        end
+        return n
+    end
+    local lacking = {}
+    for _, mp in ipairs(mexes) do
+        local mPD, mAA = wantPD - Count(pds, mp[1], mp[3]), wantAA - Count(aas, mp[1], mp[3])
+        if mPD > 0 or mAA > 0 then
+            table.insert(lacking, { x = mp[1], z = mp[3], pd = math.max(mPD, 0), aa = math.max(mAA, 0), d = Dist(mp[1], mp[3], ctx.baseX, ctx.baseZ) })
+        end
+    end
+    if table.getn(lacking) == 0 then return Say(ctx, 'mex_defense: all ' .. table.getn(mexes) .. ' mass extractors are covered by point defence and anti-air') end
+    table.sort(lacking, function(p, q) return p.d > q.d end)
+
+    local res, queued, covered = {}, 0, 0
+    for i = 1, math.min(Num(a.n, 3, 1, 10), table.getn(lacking)) do
+        local m = lacking[i]
+        local did = false
+        for _, job in ipairs({ { pdBp, m.pd }, { aaBp, m.aa } }) do
+            local bpid = job[1]
+            if bpid then
+                local sx, sz = Skirt(bpid)
+                for k = 1, job[2] do
+                    local x, z = Spiral(ctx, bpid, m.x, m.z, radius, 2, res)
+                    if x then
+                        Reserve(res, x, z, math.max(sx, sz) / 2)
+                        IssueBuildMobile(ctx.sacus, Vec(x, z), bpid, {})
+                        queued = queued + 1
+                        did = true
+                    end
+                end
+            end
+        end
+        if did then covered = covered + 1 end
+    end
+    Say(ctx, string.format('mex_defense: %d defence structures queued next to %d of %d mass extractors that lacked cover', queued, covered, table.getn(lacking)))
+end

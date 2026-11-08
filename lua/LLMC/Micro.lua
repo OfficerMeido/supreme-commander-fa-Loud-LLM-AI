@@ -162,6 +162,7 @@ end
 -- Called every second by the controller: expire old holds, forget dead units.
 function Maintain(brain, cfg, now)
     ClaimSacus(brain, now)
+    if cfg.CleanStaleAssist ~= false then K.ClearStale(SacuList(), now, cfg.StaleAssistSeconds or 6) end     -- gateway ACUs left guarding something that is done
     if cfg.Takeover == 'army' then
         ClaimAllCombat(brain, now)
         IdleFallback(brain, cfg, now)
@@ -296,7 +297,7 @@ function BuildState(brain, cfg, seq, sid, now, lastResults)
     -- Quantum Gateway ACUs (owned by the LLM) and base-defence status
     local sacuIdle, sacuIds = 0, {}
     for _, u in ipairs(sacuList) do
-        if u:IsIdleState() then sacuIdle = sacuIdle + 1 end
+        if K.EffectivelyIdle(u) then sacuIdle = sacuIdle + 1 end
         if table.getn(sacuIds) < 8 then table.insert(sacuIds, tostring(u:GetEntityId())) end
     end
     st.gateway = { built = gateways > 0, sacus = table.getn(sacuList), idle = sacuIdle, ids = sacuIds }
@@ -496,7 +497,7 @@ end
 function Handlers.assist_t4(ctx, a)
     local list = {}
     for _, u in ipairs(ctx.sacus) do
-        if a.force or u:IsIdleState() then table.insert(list, u) end
+        if a.force or K.EffectivelyIdle(u) then table.insert(list, u) end
     end
     if table.getn(list) == 0 then return Say(ctx, 'assist_t4: no idle gateway ACUs') end
     local what = AssistT4(ctx.brain, list)
@@ -507,6 +508,7 @@ end
 -- Gateway ACU actions
 function Handlers.defense_cluster(ctx, a) Gateway.DefenseCluster(ctx, a) end
 function Handlers.mass_farm(ctx, a) Gateway.MassFarm(ctx, a) end
+function Handlers.mex_defense(ctx, a) Gateway.MexDefense(ctx, a) end
 function Handlers.experimental(ctx, a) Gateway.Experimental(ctx, a) end
 
 -- {"a":"sacu","cmd":"move|retreat|stop","x":..,"z":..}: move the gateway ACUs (they are owned by the LLM permanently)
@@ -565,7 +567,7 @@ end
 --   3. otherwise, mass is short   -> mass_farm (T3 power plant ringed by T2 fabricators)
 ---------------------------------------------------------------------------------------------------
 AutoRecent = {}
-local AutoCool, DefBlock, FarmBlock = 0, 0, 0
+local AutoCool, DefBlock, FarmBlock, MexDefBlock = 0, 0, 0, 0
 
 local function ANote(now, msg)
     table.insert(AutoRecent, 't' .. math.floor(now) .. ' ' .. msg)
@@ -623,7 +625,7 @@ function Auto(brain, cfg, now)
     local sacus = SacuList()
     if table.getn(sacus) == 0 then return end
     local idleList = {}
-    for _, u in ipairs(sacus) do if u:IsIdleState() then table.insert(idleList, u) end end
+    for _, u in ipairs(sacus) do if K.EffectivelyIdle(u) then table.insert(idleList, u) end end
 
     local mr, er = 0, 0
     pcall(function() mr = brain:GetEconomyStoredRatio('MASS') er = brain:GetEconomyStoredRatio('ENERGY') end)
@@ -664,6 +666,8 @@ function Auto(brain, cfg, now)
             act, why = { a = 'experimental', what = 'any', near = { bx, bz } }, 'mass not being used'
         elseif mr < 0.5 and er >= 0.6 and now >= FarmBlock and Gateway.Farms < (cfg.MaxMassFarms or 3) then
             act, why = { a = 'mass_farm', near = { bx, bz } }, 'need more mass'
+        elseif cfg.GatewayMexDefense ~= false and now >= MexDefBlock and mr >= 0.15 then
+            act, why = { a = 'mex_defense', n = 3 }, 'mass extractors need point defence and anti-air'
         end
     end
     if not act then return end
@@ -673,5 +677,8 @@ function Auto(brain, cfg, now)
     AutoCool = now + 45
     if act.a == 'defense_cluster' and Gateway.Clusters == c0 then DefBlock = now + 300 end
     if act.a == 'mass_farm' and Gateway.Farms == f0 then FarmBlock = now + 300 end
+    if act.a == 'mex_defense' then
+        if string.find(tostring(results[1]), 'covered', 1, true) then MexDefBlock = now + 300 else MexDefBlock = now + 90 end
+    end
     ANote(now, act.a .. ' (' .. why .. '): ' .. tostring(results[1]))
 end

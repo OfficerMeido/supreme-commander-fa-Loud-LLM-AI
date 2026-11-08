@@ -217,3 +217,48 @@ function Markers(markerType)
     MarkerCache[markerType] = list
     return list
 end
+
+
+---------------------------------------------------------------------------------------------------
+-- "Effectively idle": the engine says a unit is busy (it has a command) but it does nothing useful.
+-- An ASSIST (Guard) order never ends by itself: when the unit it helps finishes or stops, the helper stands there forever,
+-- still "busy" for the engine, and every build order queued behind the dead Guard order never starts.
+---------------------------------------------------------------------------------------------------
+local WorkStates = { 'Building', 'Repairing', 'Reclaiming', 'Capturing', 'Upgrading', 'Enhancing', 'Attacking', 'Moving', 'Patrolling', 'Sacrificing' }
+
+function EffectivelyIdle(u)
+    if u:IsIdleState() then return true end
+    local focus = nil
+    pcall(function() focus = u:GetFocusUnit() end)       -- what it is building / the real construction it is helping with
+    if focus and not focus.Dead then return false end
+    for _, name in ipairs(WorkStates) do
+        local ok, v = pcall(function() return u:IsUnitState(name) end)
+        if ok and v then return false end
+    end
+    return true
+end
+
+StaleSince = {}          -- entity id -> game time it was first seen "busy but doing nothing"
+
+-- Clears the commands of units that have been busy-but-doing-nothing for `secs` seconds. Returns how many were cleared.
+function ClearStale(units, now, secs)
+    local clear = {}
+    for _, u in ipairs(units) do
+        if not u.Dead then
+            local id = tostring(u:GetEntityId())
+            if (not u:IsIdleState()) and EffectivelyIdle(u) then
+                local t = StaleSince[id]
+                if not t then
+                    StaleSince[id] = now
+                elseif now - t >= (secs or 6) then
+                    table.insert(clear, u)
+                    StaleSince[id] = nil
+                end
+            else
+                StaleSince[id] = nil
+            end
+        end
+    end
+    if table.getn(clear) > 0 then IssueClearCommands(clear) end
+    return table.getn(clear)
+end

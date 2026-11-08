@@ -85,6 +85,7 @@ function Main()
     S.macro, S.auto_attack, S.tech = Cfg.Macro, Cfg.AutoAttack, Cfg.TechTarget
     if train then S.macro = false S.auto_attack = false end
     local nextEco = 0
+    local nextClean = 0
     local idx = brain:GetArmyIndex()
     if train then Reward.Reset(idx, Cfg) end
     S.attack_size, S.land_factories, S.air_factories = Cfg.AttackSize, Cfg.LandFactories, Cfg.AirFactories
@@ -188,6 +189,14 @@ function Main()
             end
             LOG('LLMC|A|' .. box.seq .. '|' .. tostring(count))
             pending = false
+        end
+
+        -- 1a. clear dead assist orders (engineers that help a unit which has finished and now just stand there)
+        if now >= nextClean then
+            nextClean = now + 3
+            if Cfg.CleanStaleAssist ~= false and (train or Cfg.Takeover == 'replace') then
+                pcall(Actions.CleanStale, brain, Cfg, now)
+            end
         end
 
         -- 1b. automatic macro (eco, tech, production, waves) - independent of LLM latency

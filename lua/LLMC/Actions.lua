@@ -84,12 +84,12 @@ end
 local function Ranked(ctx, x, z, idleOnly, noACU)
     local out = {}
     for _, e in ipairs(Engineers(ctx)) do
-      if not (noACU and e.acu) and not (idleOnly and ((not e.unit:IsIdleState()) or ctx.load[e.unit]))
+      if not (noACU and e.acu) and not (idleOnly and ((not K.EffectivelyIdle(e.unit)) or ctx.load[e.unit]))
          and not (ctx.wait and ((not ctx.idle0[e.unit]) or (ctx.load[e.unit] or 0) >= (ctx.cfg.TrainMaxJobsPerTurn or 3)))
          and not (ctx.cfg.FreeRules and QueueLen(e.unit) >= (ctx.cfg.TrainMaxQueue or 4)) then
         local p = e.unit:GetPosition()
         local score = Dist(p[1], p[3], x, z)
-        if not e.unit:IsIdleState() then score = score + 150 + 25 * QueueLen(e.unit) end
+        if not K.EffectivelyIdle(e.unit) then score = score + 150 + 25 * QueueLen(e.unit) end
         if e.acu then score = score + 300 end
         score = score + 80 * (ctx.load[e.unit] or 0)
         table.insert(out, { unit = e.unit, score = score, acu = e.acu })
@@ -134,8 +134,53 @@ local function Snap(v, size)
     return math.floor(v + 0.5)
 end
 
+-- Highest tech tier of our finished factories (1-3): the "tech level" used for the power thresholds.
+local function CurrentTech(ctx)
+    local t = 1
+    for _, u in ipairs(K.Select(ctx.all, K.Recipes.factory)) do
+        local tt = K.TechOf(u:GetUnitId())
+        if tt > t then t = tt end
+    end
+    return math.min(t, 3)
+end
+
+-- Energy income (per second) below which power counts as LOW for the current tech level (Config.PowerLowIncome).
+local function PowerLowThreshold(ctx)
+    local tbl = ctx.cfg.PowerLowIncome or { 60, 200, 500 }
+    return tbl[CurrentTech(ctx)] or tbl[1]
+end
+
+-- positions {x,z} of our radars (finished, under construction, or ordered recently)
+local function RadarSpots(ctx)
+    local out = {}
+    for _, u in ipairs(ctx.brain:GetListOfUnits(categories.ALLUNITS, false)) do
+        if not u.Dead then
+            local bpid = u:GetUnitId()
+            if K.CatSet(bpid).STRUCTURE and K.StructureKind(bpid) == 'radar' then
+                local p = u:GetPosition()
+                table.insert(out, { p[1], p[3] })
+            end
+        end
+    end
+    local now = GetGameTimeSeconds()
+    for _, e in ipairs(Pending) do
+        if e.kind == 'radar' and now - e.t < 300 then table.insert(out, { e.x, e.z }) end
+    end
+    return out
+end
+
+local function TooClose(list, x, z, r)
+    if not list then return false end
+    for _, p in ipairs(list) do
+        local dx, dz = p[1] - x, p[2] - z
+        if math.sqrt(dx * dx + dz * dz) < r then return true end
+    end
+    return false
+end
+
 -- markers = nil  -> spiral search around (cx,cz);  markers = {{x,z},..} -> nearest free marker within radius
-local function FindSpot(ctx, bpid, cx, cz, radius, markers)
+-- avoid = {{x,z},..} + avoidR: spots closer than avoidR to any of them are rejected (used for radar spacing)
+local function FindSpot(ctx, bpid, cx, cz, radius, markers, avoid, avoidR)
     local brain = ctx.brain
     local bp = __blueprints[bpid]
     local sx, sz = Skirt(bp)
@@ -171,7 +216,7 @@ local function FindSpot(ctx, bpid, cx, cz, radius, markers)
         end
         for _, c in ipairs(cand) do
             local x, z = Clamp(Snap(cx + c[1] * step, sx), Snap(cz + c[2] * step, sz))
-            if (not Reserved(x, z, half))
+            if (not Reserved(x, z, half)) and (not TooClose(avoid, x, z, avoidR or 0))
                and brain:CanBuildStructureAt(bpid, { x, GetSurfaceHeight(x, z), z }) then
                 Reserve(x, z, half)
                 return x, z
@@ -274,8 +319,11 @@ function Handlers.build(ctx, a)
                 eInc = ctx.brain:GetEconomyIncome('ENERGY') * 10
                 eDem = ctx.brain:GetEconomyRequested('ENERGY') * 10
             end)
-            if er >= (ctx.cfg.TrainPowerFull or 0.8) and eInc >= eDem * (ctx.cfg.TrainPowerSurplus or 1.0) then
-                return Say(ctx, string.format('build %s skipped: power is already sufficient (storage %d%%, income %d/s >= demand %d/s). Build something else: mass extractors, factories, combat units, defences.', kind, er * 100, eInc, eDem))
+            -- power is only "sufficient" when income is NOT low for the current tech level (T1 60/s, T2 200/s, T3 500/s by default;
+            -- the start, with just the ACU's 20/s, is LOW) AND storage is nearly full AND income covers demand
+            local lowT = PowerLowThreshold(ctx)
+            if eInc >= lowT and er >= (ctx.cfg.TrainPowerFull or 0.8) and eInc >= eDem * (ctx.cfg.TrainPowerSurplus or 1.0) then
+                return Say(ctx, string.format('build %s skipped: power is already sufficient for tech %d (income %d/s is not low - low is under %d/s - storage %d%%, demand %d/s). Build something else: mass extractors, factories, combat units, defences.', kind, CurrentTech(ctx), eInc, lowT, er * 100, eDem))
             end
         end
     end
@@ -287,16 +335,27 @@ function Handlers.build(ctx, a)
     local markers = nil
     if isMarker then markers = K.Markers(kind == 'mex' and 'Mass' or 'Hydrocarbon') end
 
+    -- RADAR SPACING: radars must be at least Config.RadarSpacing (115) apart - they would just cover the same ground
+    local avoid, avoidR = nil, nil
+    if skind == 'radar' and (ctx.cfg.RadarSpacing or 115) > 0 then
+        avoid, avoidR = RadarSpots(ctx), ctx.cfg.RadarSpacing or 115
+    end
     local placed, failed = 0, {}
     for i = 1, n do
         local did = false
         for _, e in ipairs(Ranked(ctx, cx, cz, a.idle_only, a.no_acu)) do
             local bpid = K.BestBuildable(e.unit, cands, tech)
             if bpid and not failed[bpid] then
-                local x, z = FindSpot(ctx, bpid, cx, cz, radius, markers)
+                local x, z = FindSpot(ctx, bpid, cx, cz, radius, markers, avoid, avoidR)
                 if x then
+                    -- priority: drop the builder's current queue first (once per turn), so this job starts NOW
+                    if a.priority and not ctx.cleared[e.unit] then
+                        IssueClearCommands({ e.unit })
+                        ctx.cleared[e.unit] = true
+                    end
                     IssueBuildMobile({ e.unit }, Vec(x, z), bpid, {})
                     table.insert(Pending, { kind = skind, x = x, z = z, t = GetGameTimeSeconds() })
+                    if avoid then table.insert(avoid, { x, z }) end
                     ctx.load[e.unit] = (ctx.load[e.unit] or 0) + 1
                     placed = placed + 1
                     did = true
@@ -307,6 +366,9 @@ function Handlers.build(ctx, a)
             end
         end
         if not did then break end
+    end
+    if avoid and placed < n then
+        Say(ctx, 'build radar: radars must be at least ' .. avoidR .. ' apart - no spot found within ' .. radius .. ' of that point that is far enough from your other radars; pick "near" a different place (a radar covers a radius of about ' .. avoidR .. ')')
     end
     Say(ctx, string.format('build %s x%d: %d queued%s', kind, n, placed,
         placed < n and (ctx.wait and ' (no IDLE builder for the rest: engineers and the ACU take new orders only after finishing the previous ones - wait for state.engineers.idle_ids / state.acu.idle; or no tech/spot)' or ' (no free builder / tech / spot for the rest; builders with 4+ queued jobs are skipped)') or ''))
@@ -348,7 +410,7 @@ function Handlers.produce(ctx, a)
     end
     if isEng and not ctx.trusted and not ctx.cfg.FreeRules then
         for _, e in ipairs(K.Select(ctx.all, K.Units.engineer)) do
-            if e:IsIdleState() then
+            if K.EffectivelyIdle(e) then
                 return Say(ctx, 'produce engineer skipped: an engineer is idle - give it work (or let it assist an upgrade) instead of building more')
             end
         end
@@ -463,6 +525,15 @@ function Handlers.assist(ctx, a)
     local tcat = K.CatSet(target:GetUnitId())
     local okMex = tcat.MASSEXTRACTION and tcat.STRUCTURE and target:IsUnitState('Upgrading')
     local okAcu = tcat.COMMAND and target:IsUnitState('Enhancing')
+    if ctx.cfg.FreeRules then
+        -- only assist something that is really under construction / upgrading (and is not itself just assisting)
+        local focus = nil
+        pcall(function() focus = target:GetFocusUnit() end)
+        local working = (target:GetFractionComplete() < 1) or target:IsUnitState('Upgrading') or target:IsUnitState('Building') or (focus ~= nil)
+        if target:IsUnitState('Guarding') or not working then
+            return Say(ctx, 'assist refused: that unit is not building or upgrading anything - an engineer assisting it would just stand there')
+        end
+    end
     if not (okMex or okAcu or ctx.cfg.FreeRules) then
         return Say(ctx, 'assist refused: engineers/ACU only assist a mass extractor upgrade or an ACU upgrade')
     end
@@ -534,6 +605,85 @@ function Handlers.strategy(ctx, a)
     if a.macro ~= nil then S.macro = a.macro and true or false end
     if a.auto_attack ~= nil then S.auto_attack = a.auto_attack and true or false end
     Say(ctx, 'strategy updated')
+end
+
+-- {"a":"mex_defense","n":3,"pd":1,"aa":1,"tech":2}: a point defence and an anti-air next to mass extractors that lack them
+-- (most exposed = farthest from the base first). An extractor is "covered" when enough PD / AA stand within Config.MexDefenseCover.
+function Handlers.mex_defense(ctx, a)
+    if EcoOnly(ctx) then return Say(ctx, 'mex_defense skipped: economy-only phase') end
+    local mr, er = 1, 1
+    pcall(function() mr = ctx.brain:GetEconomyStoredRatio('MASS') er = ctx.brain:GetEconomyStoredRatio('ENERGY') end)
+    if mr < (ctx.cfg.MinMassRatio or 0.15) or er < (ctx.cfg.MinEnergyRatio or 0.25) then
+        return Say(ctx, 'mex_defense skipped: not enough stored mass/energy for defences yet')
+    end
+    local cover = Num(a.cover, ctx.cfg.MexDefenseCover or 20, 5, 60)
+    local radius = Num(a.radius, ctx.cfg.MexDefenseRadius or 12, 4, 30)
+    local wantPD, wantAA = Num(a.pd, ctx.cfg.MexDefensePD or 1, 0, 3), Num(a.aa, ctx.cfg.MexDefenseAA or 1, 0, 3)
+    local tech = Num(a.tech, ctx.cfg.MexDefenseTech or 2, 1, 3)
+    local maxMex = Num(a.n, 3, 1, 10)
+
+    local mexes, pds, aas = {}, {}, {}
+    for _, u in ipairs(ctx.all) do
+        if not u.Dead then
+            local bpid = u:GetUnitId()
+            if K.CatSet(bpid).STRUCTURE then
+                local k = K.StructureKind(bpid)
+                if k == 'mex' then table.insert(mexes, u:GetPosition())
+                elseif k == 'pd' then table.insert(pds, u:GetPosition())
+                elseif k == 'aa' then table.insert(aas, u:GetPosition()) end
+            end
+        end
+    end
+    local now = GetGameTimeSeconds()
+    for _, e in ipairs(Pending) do            -- defences ordered but not finished count as cover
+        if now - e.t < 300 then
+            if e.kind == 'pd' then table.insert(pds, { e.x, 0, e.z }) elseif e.kind == 'aa' then table.insert(aas, { e.x, 0, e.z }) end
+        end
+    end
+    local function Count(list, x, z)
+        local n = 0
+        for _, p in ipairs(list) do
+            if Dist(p[1], p[3], x, z) <= cover then n = n + 1 end
+        end
+        return n
+    end
+    local lacking = {}
+    for _, mp in ipairs(mexes) do
+        local mPD, mAA = wantPD - Count(pds, mp[1], mp[3]), wantAA - Count(aas, mp[1], mp[3])
+        if mPD > 0 or mAA > 0 then
+            table.insert(lacking, { x = mp[1], z = mp[3], pd = math.max(mPD, 0), aa = math.max(mAA, 0), d = Dist(mp[1], mp[3], ctx.baseX, ctx.baseZ) })
+        end
+    end
+    if table.getn(lacking) == 0 then return Say(ctx, 'mex_defense: all ' .. table.getn(mexes) .. ' mass extractors are covered by point defence and anti-air') end
+    table.sort(lacking, function(p, q) return p.d > q.d end)
+
+    local pdC, aaC = K.Candidates(K.Structures.pd, ctx.faction), K.Candidates(K.Structures.aa, ctx.faction)
+    local queued, covered = 0, 0
+    for i = 1, math.min(maxMex, table.getn(lacking)) do
+        local m = lacking[i]
+        local did = false
+        for _, job in ipairs({ { 'pd', pdC, m.pd }, { 'aa', aaC, m.aa } }) do
+            for k = 1, job[3] do
+                for _, e in ipairs(Ranked(ctx, m.x, m.z, a.idle_only)) do
+                    local bpid = K.BestBuildable(e.unit, job[2], tech)
+                    if bpid then
+                        local x, z = FindSpot(ctx, bpid, m.x, m.z, radius, nil)
+                        if x then
+                            IssueBuildMobile({ e.unit }, Vec(x, z), bpid, {})
+                            table.insert(Pending, { kind = job[1], x = x, z = z, t = GetGameTimeSeconds() })
+                            ctx.load[e.unit] = (ctx.load[e.unit] or 0) + 1
+                            queued = queued + 1
+                            did = true
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        if did then covered = covered + 1 end
+    end
+    Say(ctx, string.format('mex_defense: %d defence structures queued next to %d of %d mass extractors that lacked cover%s', queued, covered, table.getn(lacking),
+        queued == 0 and ' (no idle builder, tech or room)' or ''))
 end
 
 function Handlers.rally(ctx, a)
@@ -620,7 +770,7 @@ function Handlers.scout(ctx, a)   SquadOrder(ctx, a, 'scout') end
 function Execute(brain, actions, cfg, trusted)
     local bx, bz = brain:GetArmyStartPos()
     local ctx = {
-        brain = brain, cfg = cfg, results = {}, load = {}, trusted = trusted,
+        brain = brain, cfg = cfg, results = {}, load = {}, trusted = trusted, cleared = {},
         faction = brain:GetFactionIndex(), baseX = bx, baseZ = bz,
         all = brain:GetListOfUnits(categories.ALLUNITS, false, true),
         units = {},
@@ -637,6 +787,7 @@ function Execute(brain, actions, cfg, trusted)
     -- is left alone, so the agent cannot keep re-issuing the same order on top of a queue.
     ctx.wait = (cfg.FreeRules and cfg.TrainWaitForOrders ~= false) and true or false
     ctx.idle0, ctx.facUsed = {}, {}
+    local cleared = 0
     if ctx.wait then
         for _, u in ipairs(ctx.all) do
             if not u.Dead then
@@ -644,7 +795,15 @@ function Execute(brain, actions, cfg, trusted)
                 if s.FACTORY then
                     ctx.idle0[u] = (QueueLen(u) == 0)                          -- a factory is free when its queue is empty
                 elseif s.ENGINEER or s.COMMAND then
-                    ctx.idle0[u] = u:IsIdleState() and QueueLen(u) == 0
+                    if (not u:IsIdleState()) and K.EffectivelyIdle(u) then
+                        -- busy for the engine but doing nothing (e.g. assisting a unit that has finished): drop the dead
+                        -- Guard order now, otherwise the orders we give it would queue behind it and never start
+                        IssueClearCommands({ u })
+                        cleared = cleared + 1
+                        ctx.idle0[u] = true
+                    else
+                        ctx.idle0[u] = u:IsIdleState() and QueueLen(u) == 0
+                    end
                 elseif s.MOBILE then
                     ctx.idle0[u] = u:IsIdleState()
                 end
@@ -657,7 +816,8 @@ function Execute(brain, actions, cfg, trusted)
                 if s.FACTORY then ifc = ifc + 1 elseif s.ENGINEER or s.COMMAND then ie = ie + 1 else iu = iu + 1 end
             end
         end
-        Say(ctx, string.format('at the start of this turn %d engineers/ACU, %d factories and %d other units were idle (only idle ones accept new orders)', ie, ifc, iu))
+        Say(ctx, string.format('at the start of this turn %d engineers/ACU, %d factories and %d other units were idle (only idle ones accept new orders)%s', ie, ifc, iu,
+            cleared > 0 and (' - ' .. cleared .. ' engineers were only assisting something that does nothing; their dead assist orders were cleared') or ''))
     end
 
     local max = cfg.MaxActionsPerTurn or 24
@@ -678,4 +838,18 @@ function Execute(brain, actions, cfg, trusted)
         end
     end
     return ctx.results, count
+end
+
+
+-- Called every few seconds by the controller (replace / train modes): engineers and ACUs that are "busy" for the engine
+-- but have been doing nothing for a while (a dead assist order) get their commands cleared.
+function CleanStale(brain, cfg, now)
+    local list = {}
+    for _, u in ipairs(brain:GetListOfUnits(categories.ALLUNITS, false, true)) do
+        if not u.Dead then
+            local s = K.CatSet(u:GetUnitId())
+            if s.ENGINEER or s.COMMAND then table.insert(list, u) end
+        end
+    end
+    return K.ClearStale(list, now, cfg.StaleAssistSeconds or 6)
 end

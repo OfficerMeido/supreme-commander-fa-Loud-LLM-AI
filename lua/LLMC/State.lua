@@ -109,6 +109,7 @@ function Build(brain, cfg, seq, sid, now, lastResults)
     ---------------------------------------------------------------- own units
     local all = brain:GetListOfUnits(categories.ALLUNITS, false)
     local structs, building = {}, 0
+    local mexPos, pdPos, aaPos = {}, {}, {}           -- finished structures, to find mass extractors without defences
     local constr, engBusy, engQueued = {}, 0, 0      -- under construction per kind; busy engineers; queued jobs
     local factories, engIdle, engTotal = {}, {}, 0
     local squads = {}
@@ -133,11 +134,14 @@ function Build(brain, cfg, seq, sid, now, lastResults)
                 engTotal = engTotal + 1
                 table.insert(engineers, u)
                 table.insert(builders, u)
-                if u:IsIdleState() then table.insert(engIdle, tostring(u:GetEntityId())) else engBusy = engBusy + 1 end
+                if K.EffectivelyIdle(u) then table.insert(engIdle, tostring(u:GetEntityId())) else engBusy = engBusy + 1 end
                 engQueued = engQueued + QueueLen(u)
             elseif s.STRUCTURE then
                 local kind = K.StructureKind(bpid)
                 local tk = 't' .. K.TechOf(bpid)
+                if kind == 'mex' then table.insert(mexPos, u:GetPosition())
+                elseif kind == 'pd' then table.insert(pdPos, u:GetPosition())
+                elseif kind == 'aa' then table.insert(aaPos, u:GetPosition()) end
                 structs[kind] = structs[kind] or {}
                 structs[kind][tk] = (structs[kind][tk] or 0) + 1
                 if s.FACTORY then
@@ -164,6 +168,22 @@ function Build(brain, cfg, seq, sid, now, lastResults)
             end
         end
     end
+    local undef = 0
+    for _, mp in ipairs(mexPos) do
+        local pdN, aaN = 0, 0
+        for _, p in ipairs(pdPos) do if Dist(p[1], p[3], mp[1], mp[3]) <= (cfg.MexDefenseCover or 20) then pdN = pdN + 1 end end
+        for _, p in ipairs(aaPos) do if Dist(p[1], p[3], mp[1], mp[3]) <= (cfg.MexDefenseCover or 20) then aaN = aaN + 1 end end
+        if pdN < (cfg.MexDefensePD or 1) or aaN < (cfg.MexDefenseAA or 1) then undef = undef + 1 end
+    end
+    st.mex_defense = { mex = table.getn(mexPos), undefended = undef }
+    -- "low power" depends on the tech level: energy income under Config.PowerLowIncome (T1 60/s, T2 200/s, T3 500/s)
+    local techLevel = 1
+    for _, f in ipairs(factories) do
+        if f.tech > techLevel then techLevel = f.tech end
+    end
+    local lowT = (cfg.PowerLowIncome or { 60, 200, 500 })[math.min(techLevel, 3)] or 60
+    st.tech_level = techLevel
+    st.power_low_income = lowT
     st.structures = structs
     st.building_in_progress = building
     st.under_construction = constr          -- e.g. {land_factory=1, pgen=2}: ordered AND started; do not order the same again
@@ -195,7 +215,7 @@ function Build(brain, cfg, seq, sid, now, lastResults)
         local mhp = acu:GetMaxHealth()
         if mhp < 1 then mhp = 1 end
         st.acu = { id = tostring(acu:GetEntityId()), pos = XZ(acu:GetPosition()), hp = R1(acu:GetHealth() / mhp),
-                   idle = acu:IsIdleState(), queued_jobs = QueueLen(acu) }
+                   idle = K.EffectivelyIdle(acu), queued_jobs = QueueLen(acu) }
         -- available ACU enhancements (name + mass cost)
         pcall(function()
             local enh = acu:GetBlueprint().Enhancements
@@ -281,13 +301,17 @@ function Build(brain, cfg, seq, sid, now, lastResults)
     if cfg.FreeRules then
         local alerts = {}
         local m, e = st.eco.mass, st.eco.energy
-        if e.stored_ratio and e.stored_ratio < 0.2 then
-            table.insert(alerts, 'POWER LOW (' .. math.floor(e.stored_ratio * 100) .. '% stored): build power generators (pgen) NOW - everything slows down and you lose reward')
+        if (e.stored_ratio and e.stored_ratio < 0.2) or (e.income and e.income < lowT) then
+            table.insert(alerts, 'POWER LOW for tech ' .. techLevel .. ': income ' .. tostring(e.income) .. '/s (low = under ' .. lowT .. '/s), ' ..
+                math.floor((e.stored_ratio or 0) * 100) .. '% stored: build power generators (pgen) - everything slows down and you lose reward')
+        end
+        if undef > 0 and table.getn(mexPos) >= 2 then
+            table.insert(alerts, undef .. ' of your ' .. table.getn(mexPos) .. ' mass extractors have no point defence and/or anti-air next to them: {"a":"mex_defense","n":3}')
         end
         if e.income and e.demand and e.income < e.demand then
             table.insert(alerts, 'power income (' .. e.income .. '/s) is below demand (' .. e.demand .. '/s): build more pgen')
         end
-        if e.stored_ratio and e.stored_ratio >= 0.8 and e.income and e.demand and e.income >= e.demand then
+        if e.stored_ratio and e.stored_ratio >= 0.8 and e.income and e.demand and e.income >= e.demand and e.income >= lowT then
             table.insert(alerts, 'power is SUFFICIENT (storage ' .. math.floor(e.stored_ratio * 100) .. '%, income ' .. e.income .. '/s >= demand ' .. e.demand ..
                 '/s): more power generators are refused and useless - build mass extractors, factories, COMBAT UNITS or defences instead')
         end
